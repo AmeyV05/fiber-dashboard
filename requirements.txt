@@ -1,0 +1,10 @@
+streamlit
+plotly
+pandas
+numpy
+h5py
+imageio
+imageio-ffmpeg
+stqdm
+scipy
+kaleido 
