@@ -8,3 +8,4 @@ imageio-ffmpeg
 stqdm
 scipy
 kaleido 
+requests

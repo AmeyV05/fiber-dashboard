@@ -1,15 +1,19 @@
 import os
+import time
+import requests
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import h5py
-from scipy.interpolate import splprep, splev
 import plotly.io as pio
 import imageio
 from io import BytesIO
-from plotly.subplots import make_subplots
-import time
+import tempfile
+import base64
+from scipy.interpolate import splprep, splev
+
 try:
     from stqdm import stqdm
 except ImportError:
@@ -17,11 +21,57 @@ except ImportError:
     stqdm = lambda x, **kwargs: x
 
 # --- CONFIG ---
-data_file = 'fiber_all_processed.h5'  # Assumes it's in the repo root
+FILE_URL = "https://etprojects.blob.core.windows.net/fiber-processed-test/fiber_all_processed.h5"
 
 # --- PAGE CONFIG ---
 st.set_page_config(layout="wide")
 st.title("Ball Bearing FFT Visualization")
+
+# --- Session State Initialization ---
+if 'data' not in st.session_state:
+    st.session_state.data = None
+if 'download_complete' not in st.session_state:
+    st.session_state.download_complete = False
+if 'temp_dir' not in st.session_state:
+    st.session_state.temp_dir = tempfile.mkdtemp()
+
+# --- File download ---
+def download_data():
+    temp_file = os.path.join(st.session_state.temp_dir, "fiber_all_processed.h5")
+    
+    with st.spinner("Downloading data file... (~110MB)"):
+        try:
+            with requests.get(FILE_URL, stream=True, headers={"User-Agent": "Mozilla/5.0"}) as r:
+                r.raise_for_status()
+                
+                # Create a progress bar
+                progress_bar = st.progress(0)
+                file_size = int(r.headers.get('content-length', 0))
+                downloaded = 0
+                
+                # Save chunks
+                with open(temp_file, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            # Update progress bar
+                            if file_size:
+                                progress_bar.progress(min(downloaded / file_size, 1.0))
+            
+            # Check if it's really an HDF5 file
+            with open(temp_file, "rb") as f:
+                preview = f.read(8)
+            if not preview.startswith(b'\x89HDF'):
+                st.error("File does not appear to be a valid HDF5 file (bad signature).")
+                return None
+            
+            st.success(f"Download complete! File size: {os.path.getsize(temp_file) / 1e6:.2f} MB")
+            return temp_file
+            
+        except Exception as e:
+            st.error(f"Download failed: {str(e)}")
+            return None
 
 # --- Load Data Function ---
 @st.cache_data(show_spinner=True)
@@ -31,10 +81,18 @@ def load_fiber_data(file_path):
         fiber_data = {dataset: file[dataset][:] for dataset in datasets}
     return fiber_data
 
-# --- Load ---
-data = load_fiber_data(data_file)
+# --- Ensure data is available ---
+if st.session_state.data is None:
+    h5_file = download_data()
+    if h5_file and os.path.exists(h5_file):
+        st.session_state.data = load_fiber_data(h5_file)
+        st.session_state.download_complete = True
+    else:
+        st.error("Could not load data file.")
+        st.stop()
 
-# --- Extract ---
+# --- Extract data ---
+data = st.session_state.data
 time_vector = data['time_vector']
 freqs = data['freqs']
 fibers = [data[f'fft_fiber_1_{i}'] for i in range(1, 5)] + [data[f'fft_fiber_2_{i}'] for i in range(1, 5)]
@@ -47,11 +105,34 @@ if time_vector[0] > 1e17:
 time_formatted = pd.to_datetime(time_vector, unit='s')
 num_times = len(time_vector)
 
-# --- UI: Dropdown + Button ---
+# --- UI: Dropdown + Sliders ---
+st.sidebar.header("Visualization Controls")
 freqs_to_plot = [18.7, 37.4, 56, 57.6, 76.5, 115.6]
-freq_selected = st.selectbox("Select Frequency (Hz)", freqs_to_plot, index=1)
-start_button = st.button("Start Visualization")
-export_button = st.button("Export Video")
+freq_selected = st.sidebar.selectbox("Select Frequency (Hz)", freqs_to_plot, index=1)
+
+# Add animation speed control
+animation_speed = st.sidebar.slider("Animation Speed", min_value=0.01, max_value=1.0, value=0.2, step=0.01)
+
+# Time index slider for manual control
+time_idx = st.sidebar.slider("Time Index", min_value=0, max_value=num_times-1, value=0)
+
+# Animation options
+col1, col2 = st.sidebar.columns(2)
+start_button = col1.button("Start Animation")
+stop_button = col2.button("Stop Animation")
+
+# Export options
+export_button = st.sidebar.button("Export Video")
+export_quality = st.sidebar.select_slider("Video Quality", options=["Low", "Medium", "High"], value="Medium")
+export_fps = st.sidebar.slider("Frames per Second", min_value=1, max_value=30, value=5)
+
+if 'animate' not in st.session_state:
+    st.session_state.animate = False
+
+if start_button:
+    st.session_state.animate = True
+if stop_button:
+    st.session_state.animate = False
 
 # --- Helper: Peak Magnitude ---
 def find_peak_magnitude(fft_data, time_idx, freq_target, window=0.2):
@@ -101,77 +182,244 @@ def plot_bearing(time_idx, freq_selected):
             line=dict(color='green', width=2),
             showlegend=False))
 
+    # Add a colored heatmap on the circle based on magnitude
+    theta_interp = np.linspace(0, 2*np.pi, 100)
+    
+    # Convert points to cartesian for interpolation
+    points = np.array([np.cos(fiber_angles_rad) * radii, np.sin(fiber_angles_rad) * radii]).T
+    
+    # Only interpolate if we have enough unique points
+    if len(np.unique(points, axis=0)) >= 3:  
+        tck, u = splprep([points[:, 0], points[:, 1]], s=0, per=True)
+        xi, yi = splev(np.linspace(0, 1, 100), tck)
+        r_interp = np.sqrt(xi**2 + yi**2)
+        theta_interp_deg = np.degrees(np.arctan2(yi, xi)) % 360
+        
+        # Sort by theta for proper line drawing
+        sort_idx = np.argsort(theta_interp_deg)
+        theta_interp_deg = theta_interp_deg[sort_idx]
+        r_interp = r_interp[sort_idx]
+        
+        # Add interpolated line
+        fig.add_trace(go.Scatterpolar(
+            r=r_interp,
+            theta=theta_interp_deg,
+            mode='lines',
+            line=dict(color='rgba(255,0,0,0.5)', width=3),
+            fill='toself',
+            fillcolor='rgba(255,0,0,0.1)',
+            showlegend=False))
+
     fig.update_layout(
-        polar=dict(radialaxis=dict(visible=False, range=[0, 3])),
-        margin=dict(t=40, l=0, r=0, b=0),
-        title=f"Ball Bearing @ {freq_selected} Hz\n{time_formatted[time_idx].strftime('%H:%M:%S')}"
+        polar=dict(
+            radialaxis=dict(visible=False, range=[0, 3]),
+            angularaxis=dict(tickfont=dict(size=10))
+        ),
+        margin=dict(t=50, l=0, r=0, b=0),
+        title=dict(
+            text=f"Ball Bearing @ {freq_selected} Hz<br>{time_formatted[time_idx].strftime('%H:%M:%S')}",
+            font=dict(size=16)
+        ),
+        height=400
     )
     return fig
 
 def plot_fft(time_idx):
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
+    
     fig = go.Figure()
     for i, fiber in enumerate(fibers):
-        fig.add_trace(go.Scatter(x=freqs, y=fiber[:, time_idx], name=fiber_names[i]))
-    fig.update_layout(title="FFT Spectrum", xaxis_title='Frequency (Hz)', yaxis_title='Magnitude')
+        fig.add_trace(go.Scatter(
+            x=freqs, 
+            y=fiber[:, time_idx], 
+            name=fiber_names[i],
+            line=dict(color=colors[i % len(colors)], width=2)
+        ))
+    
+    # Add vertical line at selected frequency
+    fig.add_vline(x=freq_selected, line=dict(color="red", width=2, dash="dash"))
+    
+    fig.update_layout(
+        title="FFT Spectrum",
+        xaxis_title='Frequency (Hz)',
+        yaxis_title='Magnitude',
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
     return fig
 
-def plot_magnitude_history(freq_selected):
+def plot_magnitude_history(time_idx, freq_selected):
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
+    
     data = []
     for i, fiber in enumerate(fibers):
         mags = [find_peak_magnitude(fiber, t, freq_selected) for t in range(num_times)]
-        data.append(go.Scatter(x=time_formatted, y=mags, name=fiber_names[i]))
+        data.append(go.Scatter(
+            x=time_formatted, 
+            y=mags, 
+            name=fiber_names[i],
+            line=dict(color=colors[i % len(colors)], width=2)
+        ))
+    
     fig = go.Figure(data)
-    fig.update_layout(title="Peak Magnitude History", xaxis_title='Time', yaxis_title='Magnitude')
+    
+    # Add vertical line at current time
+    current_time = time_formatted[time_idx]
+    fig.add_vline(x=current_time, line=dict(color="red", width=2, dash="dash"))
+    
+    fig.update_layout(
+        title="Peak Magnitude History",
+        xaxis_title='Time',
+        yaxis_title='Magnitude',
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
     return fig
 
-# --- Animate or Export ---
-if start_button or export_button:
-    img_dir = "frames"
-    os.makedirs(img_dir, exist_ok=True)
-    filenames = []
+# --- Create layout ---
+st.subheader(f"Visualization for {freq_selected} Hz")
+col_bearing, col_fft = st.columns(2)
+col_history = st.container()
 
-    for t in range(num_times):
+placeholder_bearing = col_bearing.empty()
+placeholder_fft = col_fft.empty()
+placeholder_history = col_history.empty()
+
+# --- Animation Function ---
+def create_animation_frames(freq_selected, max_frames=None):
+    frames = []
+    frame_count = num_times if max_frames is None else min(max_frames, num_times)
+    
+    # Create a consistent color sequence
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
+    
+    for t in stqdm(range(frame_count), desc="Generating frames"):
+        fig = make_subplots(rows=2, cols=2, 
+                          specs=[[{"type": "polar"}, {}], [{"colspan": 2}, None]],
+                          subplot_titles=("Ball Bearing", "FFT Spectrum", "Peak Magnitude History"))
+        
+        # Add traces for bearing plot
+        bearing_fig = plot_bearing(t, freq_selected)
+        for trace in bearing_fig.data:
+            fig.add_trace(trace, row=1, col=1)
+            
+        # Add traces for FFT plot with explicit colors
+        for i, fiber in enumerate(fibers):
+            fig.add_trace(
+                go.Scatter(
+                    x=freqs, 
+                    y=fiber[:, t], 
+                    name=fiber_names[i],
+                    line=dict(color=colors[i % len(colors)], width=2)
+                ),
+                row=1, col=2
+            )
+        
+        # Add vertical line at selected frequency
+        fig.add_vline(x=freq_selected, line=dict(color="red", width=2, dash="dash"), row=1, col=2)
+            
+        # Add traces for history plot with explicit colors
+        for i, fiber in enumerate(fibers):
+            mags = [find_peak_magnitude(fiber, time_idx, freq_selected) for time_idx in range(num_times)]
+            fig.add_trace(
+                go.Scatter(
+                    x=time_formatted, 
+                    y=mags, 
+                    name=fiber_names[i],
+                    line=dict(color=colors[i % len(colors)], width=2)
+                ),
+                row=2, col=1
+            )
+        
+        # Add vertical line at current time
+        current_time = time_formatted[t]
+        fig.add_vline(x=current_time, line=dict(color="red", width=2, dash="dash"), row=2, col=1)
+        
+        # Update layout
+        fig.update_layout(
+            height=900, 
+            width=1200,
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            title=f"Ball Bearing Visualization @ {freq_selected} Hz - {time_formatted[t].strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        img_bytes = fig.to_image(format="png")
+        frames.append(img_bytes)
+    
+    return frames
+
+# Function to create a download link for the generated video
+def get_binary_file_downloader_html(bin_file, file_label='File'):
+    with open(bin_file, 'rb') as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode()
+    href = f'<a href="data:application/octet-stream;base64,{b64}" download="{os.path.basename(bin_file)}">Download {file_label}</a>'
+    return href
+
+# --- Live Animation ---
+if st.session_state.animate:
+    t = time_idx
+    while st.session_state.animate and t < num_times:
         fig_bearing = plot_bearing(t, freq_selected)
         fig_fft = plot_fft(t)
-        fig_hist = plot_magnitude_history(freq_selected)
+        fig_hist = plot_magnitude_history(t, freq_selected)
 
-        # Combine as subplot
-        fig = make_subplots(rows=2, cols=2, specs=[[{"type": "polar"}, {}], [{"colspan": 2}, None]],
-                            subplot_titles=("Ball Bearing", "FFT", "History"))
-        for trace in fig_bearing.data:
-            fig.add_trace(trace, row=1, col=1)
-        for trace in fig_fft.data:
-            fig.add_trace(trace, row=1, col=2)
-        for trace in fig_hist.data:
-            fig.add_trace(trace, row=2, col=1)
+        placeholder_bearing.plotly_chart(fig_bearing, use_container_width=True, key=f"bearing_{t}")
+        placeholder_fft.plotly_chart(fig_fft, use_container_width=True, key=f"fft_{t}")
+        placeholder_history.plotly_chart(fig_hist, use_container_width=True, key=f"hist_{t}")
 
-        fig.update_layout(height=700, width=1200, showlegend=False)
+        t = (t + 1) % num_times
+        time.sleep(animation_speed)
+        
+        # Check if stop button was pressed
+        if not st.session_state.animate:
+            break
+else:
+    # Show static plots based on slider
+    fig_bearing = plot_bearing(time_idx, freq_selected)
+    fig_fft = plot_fft(time_idx)
+    fig_hist = plot_magnitude_history(time_idx, freq_selected)
 
-        if export_button:
-            file = f"{img_dir}/frame_{t:04d}.png"
-            pio.write_image(fig, file, format='png', width=1200, height=700)
-            filenames.append(file)
-        else:
-            # Create placeholders
-            placeholder_bearing = st.empty()
-            placeholder_fft = st.empty()
-            placeholder_history = st.empty()
+    placeholder_bearing.plotly_chart(fig_bearing, use_container_width=True, key="static_bearing")
+    placeholder_fft.plotly_chart(fig_fft, use_container_width=True, key="static_fft")
+    placeholder_history.plotly_chart(fig_hist, use_container_width=True, key="static_history")
 
-            # Animation loop
-            for t in range(num_times):
-                fig_bearing = plot_bearing(t, freq_selected)
-                fig_fft = plot_fft(t)
-                fig_hist = plot_magnitude_history(freq_selected)
+# --- Export Video ---
+if export_button:
+    with st.spinner("Exporting video... this may take some time"):
+        # Set quality based on selection
+        if export_quality == "Low":
+            frame_count = min(50, num_times)
+            video_dims = (800, 600)
+        elif export_quality == "Medium":
+            frame_count = min(100, num_times)
+            video_dims = (1200, 900)
+        else:  # High
+            frame_count = num_times
+            video_dims = (1920, 1080)
+        
+        # Generate frames
+        frames = create_animation_frames(freq_selected, frame_count)
+        
+        # Create video file
+        video_filename = os.path.join(st.session_state.temp_dir, f"bearing_video_{freq_selected}Hz.mp4")
+        
+        with imageio.get_writer(video_filename, fps=export_fps) as writer:
+            for frame in frames:
+                img = imageio.imread(frame)
+                writer.append_data(img)
+        
+        # Provide download link
+        st.markdown(get_binary_file_downloader_html(video_filename, f'Bearing Video ({freq_selected} Hz)'), unsafe_allow_html=True)
+        st.success(f"Video created successfully! Click the link above to download.")
 
-                placeholder_bearing.plotly_chart(fig_bearing, use_container_width=True, key=f"bearing_{t}")
-                placeholder_fft.plotly_chart(fig_fft, use_container_width=True, key=f"fft_{t}")
-                placeholder_history.plotly_chart(fig_hist, use_container_width=True, key=f"hist_{t}")
+# Cleanup temporary files when app is closed
+# Note: This might not always run in Streamlit cloud environment
+def cleanup():
+    if os.path.exists(st.session_state.temp_dir):
+        import shutil
+        shutil.rmtree(st.session_state.temp_dir)
 
-                time.sleep(0.2)
-
-    if export_button:
-        video_out = f"bearing_video_{freq_selected}Hz.mp4"
-        with imageio.get_writer(video_out, fps=5) as writer:
-            for fname in filenames:
-                writer.append_data(imageio.imread(fname))
-        st.success(f"Video saved as {video_out}")
+import atexit
+atexit.register(cleanup)
