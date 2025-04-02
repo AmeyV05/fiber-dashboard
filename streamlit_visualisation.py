@@ -228,10 +228,39 @@ def plot_bearing_cached(time_idx, freq_selected):
     # Convert points to cartesian for interpolation
     points = np.array([np.cos(fiber_angles_rad) * radii, np.sin(fiber_angles_rad) * radii]).T
     
+    # Debug print to verify point order
+    point_order = []
+    for i, (angle, r) in enumerate(zip(fiber_angles_deg, radii)):
+        point_order.append(f"{fiber_names[i]}: {angle}° ({r:.2f})")
+    
+    # Add direct lines connecting the points in order (no interpolation)
+    # This shows the raw sensor data connection
+    ordered_thetas = fiber_angles_deg.copy()
+    ordered_rs = radii.copy()
+    # Add first point at the end to close the loop
+    ordered_thetas.append(fiber_angles_deg[0])
+    ordered_rs.append(radii[0])
+    
+    fig.add_trace(go.Scatterpolar(
+        r=ordered_rs,
+        theta=ordered_thetas,
+        mode='lines',
+        line=dict(color='blue', width=2, dash='dot'),
+        name="Raw Data",
+        showlegend=False
+    ))
+    
     # Only interpolate if we have enough unique points
     if len(np.unique(points, axis=0)) >= 3:  
+        # Use periodic boundary condition for a closed curve
         tck, u = splprep([points[:, 0], points[:, 1]], s=0, per=True)
-        xi, yi = splev(np.linspace(0, 1, 100), tck)
+        
+        # Use more points for smoother interpolation
+        interp_points = 200
+        t = np.linspace(0, 1, interp_points)
+        xi, yi = splev(t, tck)
+        
+        # Convert back to polar coordinates
         r_interp = np.sqrt(xi**2 + yi**2)
         theta_interp_deg = np.degrees(np.arctan2(yi, xi)) % 360
         
@@ -249,6 +278,20 @@ def plot_bearing_cached(time_idx, freq_selected):
             fill='toself',
             fillcolor='rgba(255,0,0,0.1)',
             showlegend=False))
+        
+        # Show the actual interpolation points to visualize how the spline is constructed
+        # Take 8 evenly spaced points from the interpolation (matching number of original points)
+        sample_indices = np.linspace(0, interp_points-1, len(fiber_angles_deg), dtype=int)
+        sample_r = [r_interp[sort_idx[i]] for i in sample_indices]
+        sample_theta = [theta_interp_deg[sort_idx[i]] for i in sample_indices]
+        
+        fig.add_trace(go.Scatterpolar(
+            r=sample_r,
+            theta=sample_theta,
+            mode='markers',
+            marker=dict(size=8, color='red'),
+            showlegend=False
+        ))
 
     fig.update_layout(
         polar=dict(
