@@ -365,18 +365,18 @@ if st.session_state.animate:
         fig_fft = plot_fft(t)
         fig_hist = plot_magnitude_history(t, freq_selected)
 
-        placeholder_bearing.plotly_chart(fig_bearing, use_container_width=True, key=f"bearing_{t}")
-        placeholder_fft.plotly_chart(fig_fft, use_container_width=True, key=f"fft_{t}")
-        placeholder_history.plotly_chart(fig_hist, use_container_width=True, key=f"hist_{t}")
+        # Use unique keys for each frame
+        placeholder_bearing.plotly_chart(fig_bearing, use_container_width=True, key=f"bearing_{t}_{freq_selected}")
+        placeholder_fft.plotly_chart(fig_fft, use_container_width=True, key=f"fft_{t}_{freq_selected}")
+        placeholder_history.plotly_chart(fig_hist, use_container_width=True, key=f"hist_{t}_{freq_selected}")
 
-        t = (t + 1) % num_times
+        t += 1
+        if t >= num_times:
+            t = 0  # Reset to the beginning for looping
         time.sleep(animation_speed)
-        
-        # Check if stop button was pressed
-        if not st.session_state.animate:
-            break
+
+# Show static plots based on slider when not animating
 else:
-    # Show static plots based on slider
     fig_bearing = plot_bearing(time_idx, freq_selected)
     fig_fft = plot_fft(time_idx)
     fig_hist = plot_magnitude_history(time_idx, freq_selected)
