@@ -369,6 +369,20 @@ def create_animation_frames(freq_selected, max_frames=None, quality="Medium"):
     # Get magnitude history data for all fibers (reused across frames)
     magnitude_history_data = get_magnitude_history(freq_selected)
     
+    # Pre-compute y-axis ranges for consistent scaling
+    max_fft_value = 0
+    max_history_value = 0
+    
+    # Find max values for consistent scaling
+    for i, fiber in enumerate(fibers):
+        max_fft_value = max(max_fft_value, np.max(fiber[:, :frame_count]))
+        history_values = [find_peak_magnitude(fiber, t, freq_selected) for t in range(frame_count)]
+        max_history_value = max(max_history_value, max(history_values) if history_values else 0)
+    
+    # Add small padding to max values
+    max_fft_value *= 1.1
+    max_history_value *= 1.1
+    
     # Create a progress bar
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -452,9 +466,25 @@ def create_animation_frames(freq_selected, max_frames=None, quality="Medium"):
             margin=dict(l=50, r=50, t=100, b=50)
         )
         
-        # Save frame to disk instead of keeping in memory
+        # Set consistent y-axis ranges to prevent auto-scaling issues
+        fig.update_yaxes(range=[0, max_fft_value], row=1, col=2)
+        fig.update_yaxes(range=[0, max_history_value], row=2, col=1)
+        
+        # Set axis titles
+        fig.update_xaxes(title_text="Frequency (Hz)", row=1, col=2)
+        fig.update_yaxes(title_text="Magnitude", row=1, col=2)
+        fig.update_xaxes(title_text="Time", row=2, col=1)
+        fig.update_yaxes(title_text="Magnitude", row=2, col=1)
+        
+        # Ensure all subplot axes are visible
+        fig.update_xaxes(showticklabels=True, showgrid=True, zeroline=True, row=1, col=2)
+        fig.update_yaxes(showticklabels=True, showgrid=True, zeroline=True, row=1, col=2)
+        fig.update_xaxes(showticklabels=True, showgrid=True, zeroline=True, row=2, col=1)
+        fig.update_yaxes(showticklabels=True, showgrid=True, zeroline=True, row=2, col=1)
+        
+        # Save frame to disk with higher quality
         frame_path = os.path.join(frames_dir, f"frame_{t:04d}.png")
-        fig.write_image(frame_path, width=img_width, height=img_height)
+        fig.write_image(frame_path, width=img_width, height=img_height, scale=2)  # scale=2 for higher resolution
         frame_paths.append(frame_path)
         
         # Close figure to free memory
