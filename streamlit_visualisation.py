@@ -252,6 +252,8 @@ def plot_bearing_cached(time_idx, freq_selected):
     
     # Only interpolate if we have enough unique points
     if len(np.unique(points, axis=0)) >= 3:  
+        #add the the first point to the end of the points array
+        points = np.vstack((points, points[0]))
         # Use periodic boundary condition for a closed curve
         tck, u = splprep([points[:, 0], points[:, 1]], s=0, per=True)
         
