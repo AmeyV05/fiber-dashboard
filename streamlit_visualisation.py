@@ -424,8 +424,8 @@ def create_animation_frames(freq_selected, max_frames=None, quality="Medium"):
         history_values = [find_peak_magnitude(fiber, t, freq_selected) for t in range(frame_count)]
         max_history_value = max(max_history_value, max(history_values) if history_values else 0)
     
-    # Add small padding to max values
-    max_fft_value *= 1.1
+    # Add small padding to max values and ensure minimum scale
+    max_fft_value = max(max_fft_value * 1.1, 0.05)  # Ensure minimum y-scale for visibility
     max_history_value *= 1.1
     
     # Determine consistent x-axis range for FFT spectrum
@@ -454,14 +454,18 @@ def create_animation_frames(freq_selected, max_frames=None, quality="Medium"):
         for trace in bearing_fig.data:
             fig.add_trace(trace, row=1, col=1)
             
-        # Add FFT plot traces with explicit colors
+        # Add FFT plot traces with explicit colors and increased line width for visibility
         for i, fiber in enumerate(fibers):
+            # Apply some minimum scaling to ensure small values are visible
+            y_values = fiber[:, t].copy()
+            
             fig.add_trace(
                 go.Scatter(
                     x=freqs, 
-                    y=fiber[:, t], 
+                    y=y_values, 
                     name=fiber_names[i],
-                    line=dict(color=colors[i % len(colors)], width=2)
+                    line=dict(color=colors[i % len(colors)], width=2.5),  # Increase line width
+                    mode='lines'
                 ),
                 row=1, col=2
             )
@@ -478,7 +482,28 @@ def create_animation_frames(freq_selected, max_frames=None, quality="Medium"):
             line=dict(color="red", width=2, dash="dash"),
             row=1, col=2
         )
-            
+        
+        # Add a more visible point at the peak frequency for each fiber
+        for i, fiber in enumerate(fibers):
+            # Get the peak value around the selected frequency
+            peak_value = find_peak_magnitude(fiber, t, freq_selected)
+            # Highlight the peak with a marker
+            if peak_value > 0:
+                freq_indices = np.where((freqs >= freq_selected - 0.2) & (freqs <= freq_selected + 0.2))[0]
+                if len(freq_indices) > 0:
+                    max_idx = np.argmax(fiber[freq_indices, t])
+                    peak_freq = freqs[freq_indices[max_idx]]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[peak_freq],
+                            y=[peak_value],
+                            mode='markers',
+                            marker=dict(size=10, color=colors[i % len(colors)]),
+                            showlegend=False
+                        ),
+                        row=1, col=2
+                    )
+        
         # Add traces for history plot with explicit colors
         for i, data_item in enumerate(magnitude_history_data):
             fig.add_trace(
@@ -525,6 +550,130 @@ def create_animation_frames(freq_selected, max_frames=None, quality="Medium"):
         fig.update_yaxes(title_text="Magnitude", row=1, col=2)
         fig.update_xaxes(title_text="Time", row=2, col=1)
         fig.update_yaxes(title_text="Magnitude", row=2, col=1)
+        
+        # Create a zoomed view around the selected frequency in the FFT plot
+        # Add a rectangle to highlight the zoomed area
+        zoom_range = 5  # Hz on each side of the selected frequency
+        zoom_freq_min = max(0, freq_selected - zoom_range)
+        zoom_freq_max = min(max_freq_to_show, freq_selected + zoom_range)
+        
+        # Get the maximum magnitude within the zoom range for this frame
+        max_mag_in_zoom = 0
+        for fiber in fibers:
+            zoom_indices = np.where((freqs >= zoom_freq_min) & (freqs <= zoom_freq_max))[0]
+            if len(zoom_indices) > 0:
+                max_mag_in_zoom = max(max_mag_in_zoom, np.max(fiber[zoom_indices, t]))
+        
+        # Ensure we have a minimum height for visibility
+        max_mag_in_zoom = max(max_mag_in_zoom, 0.01)
+        
+        # Add a secondary y-axis for the zoomed view with dashed border
+        fig.add_shape(
+            type="rect",
+            x0=zoom_freq_min,
+            y0=0,
+            x1=zoom_freq_max,
+            y1=max_mag_in_zoom * 1.1,
+            line=dict(color="gray", width=1, dash="dash"),
+            fillcolor="rgba(0,0,0,0)",
+            row=1, col=2
+        )
+        
+        # Add text annotation for the zoomed area
+        fig.add_annotation(
+            x=(zoom_freq_min + zoom_freq_max) / 2,
+            y=max_mag_in_zoom * 1.15,
+            text=f"Zoom {zoom_freq_min:.1f}-{zoom_freq_max:.1f} Hz",
+            showarrow=False,
+            font=dict(size=10, color="gray"),
+            row=1, col=2
+        )
+        
+        # Add an inset plot for the zoomed area
+        # Create a separate zoomed inset in the top-right corner of the FFT plot
+        inset_height = max_fft_value * 0.4  # Height of inset is 40% of main plot
+        inset_y_position = max_fft_value * 0.55  # Position at 55% from bottom
+        
+        fig.add_shape(
+            type="rect",
+            x0=max_freq_to_show * 0.6,  # Start at 60% of x-axis
+            y0=inset_y_position,
+            x1=max_freq_to_show * 0.95,  # End at 95% of x-axis
+            y1=inset_y_position + inset_height,
+            line=dict(color="black", width=1),
+            fillcolor="rgba(240,240,240,0.8)",
+            row=1, col=2
+        )
+        
+        # Add text for the inset
+        fig.add_annotation(
+            x=max_freq_to_show * 0.78,
+            y=inset_y_position + inset_height * 0.9,
+            text=f"Zoom at {freq_selected} Hz",
+            showarrow=False,
+            font=dict(size=10, color="black"),
+            row=1, col=2
+        )
+        
+        # Add mini-plots for each fiber in the inset area
+        inset_width = max_freq_to_show * 0.35  # Width of inset
+        for i, fiber in enumerate(fibers):
+            # Only include data points within zoom range
+            zoom_indices = np.where((freqs >= zoom_freq_min) & (freqs <= zoom_freq_max))[0]
+            if len(zoom_indices) > 0:
+                zoom_x = freqs[zoom_indices]
+                zoom_y = fiber[zoom_indices, t]
+                
+                # Scale to inset coordinates
+                scaled_x = max_freq_to_show * 0.6 + (zoom_x - zoom_freq_min) / (zoom_freq_max - zoom_freq_min) * inset_width
+                scaled_y = inset_y_position + zoom_y / max_mag_in_zoom * inset_height * 0.8
+                
+                # Add the zoomed line
+                fig.add_trace(
+                    go.Scatter(
+                        x=scaled_x,
+                        y=scaled_y,
+                        mode='lines',
+                        line=dict(color=colors[i % len(colors)], width=2),
+                        showlegend=False
+                    ),
+                    row=1, col=2
+                )
+                
+                # Add a peak point if it exists
+                peak_value = find_peak_magnitude(fiber, t, freq_selected)
+                if peak_value > 0:
+                    freq_indices = np.where((freqs >= freq_selected - 0.2) & (freqs <= freq_selected + 0.2))[0]
+                    if len(freq_indices) > 0:
+                        max_idx = np.argmax(fiber[freq_indices, t])
+                        peak_freq = freqs[freq_indices[max_idx]]
+                        
+                        # Scale peak to inset coordinates
+                        scaled_peak_x = max_freq_to_show * 0.6 + (peak_freq - zoom_freq_min) / (zoom_freq_max - zoom_freq_min) * inset_width
+                        scaled_peak_y = inset_y_position + peak_value / max_mag_in_zoom * inset_height * 0.8
+                        
+                        fig.add_trace(
+                            go.Scatter(
+                                x=[scaled_peak_x],
+                                y=[scaled_peak_y],
+                                mode='markers',
+                                marker=dict(size=8, color=colors[i % len(colors)]),
+                                showlegend=False
+                            ),
+                            row=1, col=2
+                        )
+        
+        # Add vertical line in the inset at the selected frequency
+        scaled_selected_x = max_freq_to_show * 0.6 + (freq_selected - zoom_freq_min) / (zoom_freq_max - zoom_freq_min) * inset_width
+        fig.add_shape(
+            type="line",
+            x0=scaled_selected_x,
+            y0=inset_y_position,
+            x1=scaled_selected_x,
+            y1=inset_y_position + inset_height,
+            line=dict(color="red", width=1, dash="dash"),
+            row=1, col=2
+        )
         
         # Ensure all subplot axes are visible
         fig.update_xaxes(showticklabels=True, showgrid=True, zeroline=True, row=1, col=2)
