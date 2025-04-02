@@ -347,8 +347,20 @@ placeholder_fft = col_fft.empty()
 placeholder_history = col_history.empty()
 
 # --- Animation Function ---
-def create_animation_frames(freq_selected, max_frames=None):
-    frames = []
+def create_animation_frames(freq_selected, max_frames=None, quality="Medium"):
+    # Create a temp directory for frames
+    frames_dir = os.path.join(st.session_state.temp_dir, "frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    frame_paths = []
+    
+    # Set image resolution based on quality
+    if quality == "Low":
+        img_width, img_height = 800, 600
+    elif quality == "Medium":
+        img_width, img_height = 1200, 900
+    else:  # High
+        img_width, img_height = 1920, 1080
+    
     frame_count = num_times if max_frames is None else min(max_frames, num_times)
     
     # Create a consistent color sequence
@@ -357,7 +369,16 @@ def create_animation_frames(freq_selected, max_frames=None):
     # Get magnitude history data for all fibers (reused across frames)
     magnitude_history_data = get_magnitude_history(freq_selected)
     
-    for t in stqdm(range(frame_count), desc="Generating frames"):
+    # Create a progress bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for t in range(frame_count):
+        # Update progress
+        progress = int((t + 1) / frame_count * 100)
+        progress_bar.progress(progress / 100)
+        status_text.text(f"Generating frame {t+1}/{frame_count} ({progress}%)")
+        
         # Create the figure with correct subplot structure
         fig = make_subplots(
             rows=2, cols=2,
@@ -421,23 +442,34 @@ def create_animation_frames(freq_selected, max_frames=None):
             row=2, col=1
         )
         
-        # Update layout
+        # Update layout - reduce margins to save space
         fig.update_layout(
-            height=900, 
-            width=1200,
+            height=img_height, 
+            width=img_width,
             showlegend=True,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            title=f"Ball Bearing Visualization @ {freq_selected} Hz - {time_formatted[t].strftime('%Y-%m-%d %H:%M:%S')}"
+            title=f"Ball Bearing @ {freq_selected} Hz - {time_formatted[t].strftime('%Y-%m-%d %H:%M:%S')}",
+            margin=dict(l=50, r=50, t=100, b=50)
         )
         
-        img_bytes = fig.to_image(format="png")
-        frames.append(img_bytes)
+        # Save frame to disk instead of keeping in memory
+        frame_path = os.path.join(frames_dir, f"frame_{t:04d}.png")
+        fig.write_image(frame_path, width=img_width, height=img_height)
+        frame_paths.append(frame_path)
         
-        # Force garbage collection periodically to prevent memory buildup
-        if t % 10 == 0:
+        # Close figure to free memory
+        fig.data = []
+        fig = None
+        
+        # Force garbage collection periodically
+        if t % 5 == 0:
             gc.collect()
     
-    return frames
+    # Clear progress indicators
+    progress_bar.empty()
+    status_text.empty()
+    
+    return frame_paths, frames_dir
 
 # Function to create a download link for the generated video
 def get_binary_file_downloader_html(bin_file, file_label='File'):
@@ -481,41 +513,113 @@ else:
 
 # --- Export Video ---
 if export_button:
-    with st.spinner("Exporting video... this may take some time"):
+    with st.spinner("Preparing for video export..."):
         # Set quality based on selection
         if export_quality == "Low":
             frame_count = min(50, num_times)
-            video_dims = (800, 600)
         elif export_quality == "Medium":
             frame_count = min(100, num_times)
-            video_dims = (1200, 900)
         else:  # High
             frame_count = num_times
-            video_dims = (1920, 1080)
+        
+        memory_before = get_memory_usage()
+        st.info(f"Memory usage before export: {memory_before:.2f} MB")
         
         try:
-            # Generate frames
-            frames = create_animation_frames(freq_selected, frame_count)
+            # Generate frames and save to disk
+            with st.spinner("Generating video frames..."):
+                frame_paths, frames_dir = create_animation_frames(freq_selected, frame_count, export_quality)
+            
+            # Report memory usage after frame generation
+            memory_after_frames = get_memory_usage()
+            st.info(f"Memory after frame generation: {memory_after_frames:.2f} MB")
             
             # Create video file
-            video_filename = os.path.join(st.session_state.temp_dir, f"bearing_video_{freq_selected}Hz.mp4")
+            with st.spinner("Compiling video from frames..."):
+                video_filename = os.path.join(st.session_state.temp_dir, f"bearing_video_{freq_selected}Hz.mp4")
+                
+                # Create a progress bar for video creation
+                video_progress = st.progress(0)
+                status_text = st.empty()
+                
+                # Use imageio to create video
+                with imageio.get_writer(video_filename, fps=export_fps) as writer:
+                    for i, frame_path in enumerate(frame_paths):
+                        # Update progress
+                        progress = int((i + 1) / len(frame_paths) * 100)
+                        video_progress.progress(progress / 100)
+                        status_text.text(f"Processing frame {i+1}/{len(frame_paths)} ({progress}%)")
+                        
+                        # Read image from disk and add to video
+                        img = imageio.imread(frame_path)
+                        writer.append_data(img)
+                        
+                        # Remove frame file after using it to save disk space
+                        os.remove(frame_path)
+                        
+                        # Force garbage collection every few frames
+                        if i % 10 == 0:
+                            gc.collect()
+                
+                # Clear progress indicators
+                video_progress.empty()
+                status_text.empty()
             
-            with imageio.get_writer(video_filename, fps=export_fps) as writer:
-                for frame in frames:
-                    img = imageio.imread(frame)
-                    writer.append_data(img)
+            # Clean up frames directory
+            try:
+                os.rmdir(frames_dir)
+            except:
+                pass
+            
+            # Report final memory usage
+            memory_final = get_memory_usage()
+            st.info(f"Final memory usage: {memory_final:.2f} MB")
             
             # Provide download link
             st.markdown(get_binary_file_downloader_html(video_filename, f'Bearing Video ({freq_selected} Hz)'), unsafe_allow_html=True)
             st.success(f"Video created successfully! Click the link above to download.")
             
             # Clear memory after video export
-            frames = None
+            frame_paths = None
             gc.collect()
             
         except Exception as e:
             st.error(f"Error creating video: {str(e)}")
             st.info("Try using a lower quality setting or fewer frames to reduce memory usage.")
+
+# Add memory info at the bottom of the page
+if st.checkbox("Show Memory Information", value=False):
+    current_memory = get_memory_usage()
+    st.write(f"Current memory usage: {current_memory:.2f} MB")
+    
+    # Add button to force garbage collection
+    if st.button("Force Memory Cleanup"):
+        before = get_memory_usage()
+        gc.collect()
+        after = get_memory_usage()
+        st.success(f"Memory cleanup complete. Before: {before:.2f} MB, After: {after:.2f} MB")
+        
+# Add function to clear temp files
+def cleanup_temp_files():
+    with st.spinner("Cleaning up temporary files..."):
+        temp_dir = st.session_state.temp_dir
+        if os.path.exists(temp_dir):
+            for root, dirs, files in os.walk(temp_dir, topdown=False):
+                for file in files:
+                    try:
+                        os.remove(os.path.join(root, file))
+                    except:
+                        pass
+                for dir in dirs:
+                    try:
+                        os.rmdir(os.path.join(root, dir))
+                    except:
+                        pass
+        st.success("Temporary files cleaned up.")
+
+# Add button to manually clear temp files
+if st.sidebar.button("Clean Temporary Files"):
+    cleanup_temp_files()
 
 # Cleanup temporary files when app is closed
 # Note: This might not always run in Streamlit cloud environment
