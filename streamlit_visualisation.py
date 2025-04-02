@@ -47,7 +47,7 @@ if 'memory_usage' not in st.session_state:
     st.session_state.memory_usage = []
 
 # --- File download ---
-@st.cache_data(ttl=3600, max_entries=1)
+@st.cache_data(ttl=24*3600, max_entries=1)
 def download_data():
     temp_file = os.path.join(st.session_state.temp_dir, "fiber_all_processed.h5")
     
@@ -86,7 +86,7 @@ def download_data():
             return None
 
 # --- Load Data Function ---
-@st.cache_data(ttl=3600, max_entries=1, show_spinner=True)
+@st.cache_data(ttl=24*3600, max_entries=1, show_spinner=True)
 def load_fiber_data(file_path):
     with h5py.File(file_path, 'r') as file:
         datasets = list(file.keys())
