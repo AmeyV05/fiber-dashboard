@@ -428,6 +428,10 @@ def create_animation_frames(freq_selected, max_frames=None, quality="Medium"):
     max_fft_value *= 1.1
     max_history_value *= 1.1
     
+    # Determine consistent x-axis range for FFT spectrum
+    # Default to showing up to 450 Hz or the max frequency available
+    max_freq_to_show = min(450, max(freqs))
+    
     # Create a progress bar
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -511,8 +515,9 @@ def create_animation_frames(freq_selected, max_frames=None, quality="Medium"):
             margin=dict(l=50, r=50, t=100, b=50)
         )
         
-        # Set consistent y-axis ranges to prevent auto-scaling issues
+        # Set consistent axis ranges to prevent auto-scaling issues
         fig.update_yaxes(range=[0, max_fft_value], row=1, col=2)
+        fig.update_xaxes(range=[0, max_freq_to_show], row=1, col=2)
         fig.update_yaxes(range=[0, max_history_value], row=2, col=1)
         
         # Set axis titles
