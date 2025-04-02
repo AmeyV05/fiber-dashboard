@@ -13,6 +13,8 @@ from io import BytesIO
 import tempfile
 import base64
 from scipy.interpolate import splprep, splev
+import psutil
+import gc
 
 try:
     from stqdm import stqdm
@@ -27,6 +29,13 @@ FILE_URL = "https://etprojects.blob.core.windows.net/fiber-processed-test/fiber_
 st.set_page_config(layout="wide")
 st.title("Ball Bearing FFT Visualization")
 
+# Memory usage monitoring
+def get_memory_usage():
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_usage_mb = memory_info.rss / 1024 / 1024
+    return memory_usage_mb
+
 # --- Session State Initialization ---
 if 'data' not in st.session_state:
     st.session_state.data = None
@@ -34,8 +43,11 @@ if 'download_complete' not in st.session_state:
     st.session_state.download_complete = False
 if 'temp_dir' not in st.session_state:
     st.session_state.temp_dir = tempfile.mkdtemp()
+if 'memory_usage' not in st.session_state:
+    st.session_state.memory_usage = []
 
 # --- File download ---
+@st.cache_data(ttl=3600, max_entries=1)
 def download_data():
     temp_file = os.path.join(st.session_state.temp_dir, "fiber_all_processed.h5")
     
@@ -74,11 +86,15 @@ def download_data():
             return None
 
 # --- Load Data Function ---
-@st.cache_data(show_spinner=True)
+@st.cache_data(ttl=3600, max_entries=1, show_spinner=True)
 def load_fiber_data(file_path):
     with h5py.File(file_path, 'r') as file:
         datasets = list(file.keys())
-        fiber_data = {dataset: file[dataset][:] for dataset in datasets}
+        # Load data in a memory-efficient way
+        fiber_data = {}
+        for dataset in datasets:
+            fiber_data[dataset] = file[dataset][:]
+            
     return fiber_data
 
 # --- Ensure data is available ---
@@ -126,6 +142,14 @@ export_button = st.sidebar.button("Export Video")
 export_quality = st.sidebar.select_slider("Video Quality", options=["Low", "Medium", "High"], value="Medium")
 export_fps = st.sidebar.slider("Frames per Second", min_value=1, max_value=30, value=5)
 
+# Memory usage info
+if st.sidebar.checkbox("Show Memory Usage", value=False):
+    current_memory = get_memory_usage()
+    st.session_state.memory_usage.append(current_memory)
+    st.sidebar.write(f"Current Memory Usage: {current_memory:.2f} MB")
+    if len(st.session_state.memory_usage) > 1:
+        st.sidebar.line_chart(st.session_state.memory_usage)
+
 if 'animate' not in st.session_state:
     st.session_state.animate = False
 
@@ -133,8 +157,23 @@ if start_button:
     st.session_state.animate = True
 if stop_button:
     st.session_state.animate = False
+    # Force garbage collection when animation stops
+    gc.collect()
 
 # --- Helper: Peak Magnitude ---
+@st.cache_data(ttl=3600, max_entries=100)
+def find_peak_magnitude_cached(freq_target, time_idx, window=0.2):
+    results = []
+    for fiber in fibers:
+        indices = np.where((freqs >= freq_target - window) & (freqs <= freq_target + window))[0]
+        if indices.size > 0:
+            peak_vals = fiber[indices, time_idx]
+            max_idx = np.argmax(peak_vals)
+            results.append(peak_vals[max_idx])
+        else:
+            results.append(0)
+    return results
+
 def find_peak_magnitude(fft_data, time_idx, freq_target, window=0.2):
     indices = np.where((freqs >= freq_target - window) & (freqs <= freq_target + window))[0]
     if indices.size > 0:
@@ -148,8 +187,9 @@ fiber_angles_deg = [270, 306, 342, 18, 90, 126, 162, 198]
 fiber_angles_rad = np.radians(fiber_angles_deg)
 
 # --- Plot Functions ---
-def plot_bearing(time_idx, freq_selected):
-    magnitudes = [find_peak_magnitude(f, time_idx, freq_selected) for f in fibers]
+@st.cache_data(ttl=60, max_entries=100)
+def plot_bearing_cached(time_idx, freq_selected):
+    magnitudes = find_peak_magnitude_cached(freq_selected, time_idx)
     max_mag = max(magnitudes) or 1.0
     radii = [1 + (m / max_mag) * 1.5 for m in magnitudes]
 
@@ -224,7 +264,11 @@ def plot_bearing(time_idx, freq_selected):
     )
     return fig
 
-def plot_fft(time_idx):
+def plot_bearing(time_idx, freq_selected):
+    return plot_bearing_cached(time_idx, freq_selected)
+
+@st.cache_data(ttl=60, max_entries=100)
+def plot_fft_cached(time_idx, freq_selected):
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
     
     fig = go.Figure()
@@ -248,20 +292,37 @@ def plot_fft(time_idx):
     )
     return fig
 
-def plot_magnitude_history(time_idx, freq_selected):
+def plot_fft(time_idx):
+    return plot_fft_cached(time_idx, freq_selected)
+
+@st.cache_data(ttl=60, max_entries=20)
+def get_magnitude_history(freq_selected):
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
     
     data = []
     for i, fiber in enumerate(fibers):
         mags = [find_peak_magnitude(fiber, t, freq_selected) for t in range(num_times)]
-        data.append(go.Scatter(
-            x=time_formatted, 
-            y=mags, 
-            name=fiber_names[i],
-            line=dict(color=colors[i % len(colors)], width=2)
-        ))
+        data.append({
+            'x': time_formatted,
+            'y': mags,
+            'name': fiber_names[i],
+            'line': dict(color=colors[i % len(colors)], width=2)
+        })
     
-    fig = go.Figure(data)
+    return data
+
+def plot_magnitude_history(time_idx, freq_selected):
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
+    
+    # Get cached magnitude history data
+    data_list = get_magnitude_history(freq_selected)
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Add traces from cached data
+    for data_item in data_list:
+        fig.add_trace(go.Scatter(**data_item))
     
     # Add vertical line at current time
     current_time = time_formatted[time_idx]
@@ -293,17 +354,23 @@ def create_animation_frames(freq_selected, max_frames=None):
     # Create a consistent color sequence
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
     
+    # Get magnitude history data for all fibers (reused across frames)
+    magnitude_history_data = get_magnitude_history(freq_selected)
+    
     for t in stqdm(range(frame_count), desc="Generating frames"):
-        fig = make_subplots(rows=2, cols=2, 
-                          specs=[[{"type": "polar"}, {}], [{"colspan": 2}, None]],
-                          subplot_titles=("Ball Bearing", "FFT Spectrum", "Peak Magnitude History"))
+        # Create the figure with correct subplot structure
+        fig = make_subplots(
+            rows=2, cols=2,
+            specs=[[{"type": "polar"}, {"type": "xy"}], [{"colspan": 2, "type": "xy"}, None]],
+            subplot_titles=("Ball Bearing", "FFT Spectrum", "Peak Magnitude History")
+        )
         
-        # Add traces for bearing plot
+        # Add bearing plot traces
         bearing_fig = plot_bearing(t, freq_selected)
         for trace in bearing_fig.data:
             fig.add_trace(trace, row=1, col=1)
             
-        # Add traces for FFT plot with explicit colors
+        # Add FFT plot traces with explicit colors
         for i, fiber in enumerate(fibers):
             fig.add_trace(
                 go.Scatter(
@@ -315,25 +382,44 @@ def create_animation_frames(freq_selected, max_frames=None):
                 row=1, col=2
             )
         
-        # Add vertical line at selected frequency
-        fig.add_vline(x=freq_selected, line=dict(color="red", width=2, dash="dash"), row=1, col=2)
+        # Add vertical line at selected frequency on FFT plot
+        fig.add_shape(
+            type="line", 
+            x0=freq_selected, 
+            y0=0, 
+            x1=freq_selected, 
+            y1=1, 
+            yref="paper",
+            xref="x2",
+            line=dict(color="red", width=2, dash="dash"),
+            row=1, col=2
+        )
             
         # Add traces for history plot with explicit colors
-        for i, fiber in enumerate(fibers):
-            mags = [find_peak_magnitude(fiber, time_idx, freq_selected) for time_idx in range(num_times)]
+        for i, data_item in enumerate(magnitude_history_data):
             fig.add_trace(
                 go.Scatter(
-                    x=time_formatted, 
-                    y=mags, 
-                    name=fiber_names[i],
-                    line=dict(color=colors[i % len(colors)], width=2)
+                    x=data_item['x'],
+                    y=data_item['y'],
+                    name=data_item['name'],
+                    line=data_item['line']
                 ),
                 row=2, col=1
             )
         
-        # Add vertical line at current time
+        # Add vertical line at current time on history plot
         current_time = time_formatted[t]
-        fig.add_vline(x=current_time, line=dict(color="red", width=2, dash="dash"), row=2, col=1)
+        fig.add_shape(
+            type="line",
+            x0=current_time,
+            y0=0,
+            x1=current_time,
+            y1=1,
+            yref="paper",
+            xref="x3",
+            line=dict(color="red", width=2, dash="dash"),
+            row=2, col=1
+        )
         
         # Update layout
         fig.update_layout(
@@ -346,6 +432,10 @@ def create_animation_frames(freq_selected, max_frames=None):
         
         img_bytes = fig.to_image(format="png")
         frames.append(img_bytes)
+        
+        # Force garbage collection periodically to prevent memory buildup
+        if t % 10 == 0:
+            gc.collect()
     
     return frames
 
@@ -375,6 +465,8 @@ if st.session_state.animate:
         if t >= num_times:
             t = 0  # Reset to the beginning for looping
             animation_cycle += 1  # Increment the cycle counter
+            # Force garbage collection at the end of each cycle
+            gc.collect()
         time.sleep(animation_speed)
 
 # Show static plots based on slider when not animating
@@ -401,20 +493,29 @@ if export_button:
             frame_count = num_times
             video_dims = (1920, 1080)
         
-        # Generate frames
-        frames = create_animation_frames(freq_selected, frame_count)
-        
-        # Create video file
-        video_filename = os.path.join(st.session_state.temp_dir, f"bearing_video_{freq_selected}Hz.mp4")
-        
-        with imageio.get_writer(video_filename, fps=export_fps) as writer:
-            for frame in frames:
-                img = imageio.imread(frame)
-                writer.append_data(img)
-        
-        # Provide download link
-        st.markdown(get_binary_file_downloader_html(video_filename, f'Bearing Video ({freq_selected} Hz)'), unsafe_allow_html=True)
-        st.success(f"Video created successfully! Click the link above to download.")
+        try:
+            # Generate frames
+            frames = create_animation_frames(freq_selected, frame_count)
+            
+            # Create video file
+            video_filename = os.path.join(st.session_state.temp_dir, f"bearing_video_{freq_selected}Hz.mp4")
+            
+            with imageio.get_writer(video_filename, fps=export_fps) as writer:
+                for frame in frames:
+                    img = imageio.imread(frame)
+                    writer.append_data(img)
+            
+            # Provide download link
+            st.markdown(get_binary_file_downloader_html(video_filename, f'Bearing Video ({freq_selected} Hz)'), unsafe_allow_html=True)
+            st.success(f"Video created successfully! Click the link above to download.")
+            
+            # Clear memory after video export
+            frames = None
+            gc.collect()
+            
+        except Exception as e:
+            st.error(f"Error creating video: {str(e)}")
+            st.info("Try using a lower quality setting or fewer frames to reduce memory usage.")
 
 # Cleanup temporary files when app is closed
 # Note: This might not always run in Streamlit cloud environment
