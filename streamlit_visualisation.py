@@ -360,19 +360,21 @@ def get_binary_file_downloader_html(bin_file, file_label='File'):
 # --- Live Animation ---
 if st.session_state.animate:
     t = time_idx
-    while st.session_state.animate and t < num_times:
+    animation_cycle = 0  # Initialize a cycle counter
+    while st.session_state.animate:
         fig_bearing = plot_bearing(t, freq_selected)
         fig_fft = plot_fft(t)
         fig_hist = plot_magnitude_history(t, freq_selected)
 
-        # Use unique keys for each frame
-        placeholder_bearing.plotly_chart(fig_bearing, use_container_width=True, key=f"bearing_{t}_{freq_selected}")
-        placeholder_fft.plotly_chart(fig_fft, use_container_width=True, key=f"fft_{t}_{freq_selected}")
-        placeholder_history.plotly_chart(fig_hist, use_container_width=True, key=f"hist_{t}_{freq_selected}")
+        # Use unique keys for each frame, including the animation cycle
+        placeholder_bearing.plotly_chart(fig_bearing, use_container_width=True, key=f"bearing_{t}_{freq_selected}_{animation_cycle}")
+        placeholder_fft.plotly_chart(fig_fft, use_container_width=True, key=f"fft_{t}_{freq_selected}_{animation_cycle}")
+        placeholder_history.plotly_chart(fig_hist, use_container_width=True, key=f"hist_{t}_{freq_selected}_{animation_cycle}")
 
         t += 1
         if t >= num_times:
             t = 0  # Reset to the beginning for looping
+            animation_cycle += 1  # Increment the cycle counter
         time.sleep(animation_speed)
 
 # Show static plots based on slider when not animating
