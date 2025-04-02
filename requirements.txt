@@ -9,3 +9,4 @@ stqdm
 scipy
 kaleido 
 requests
+psutil
