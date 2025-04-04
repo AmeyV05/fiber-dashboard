@@ -157,17 +157,24 @@ def auto_cleanup_thread():
         # Sleep for 10 minutes (600 seconds)
         time.sleep(600)
         
-        # Check if auto cleanup is enabled
-        if not st.session_state.auto_cleanup:
-            continue
-        
-        cleanup_count += 1
-        # Every 3rd cleanup (30 minutes), do a more aggressive cleanup that includes Streamlit cache
-        clear_st_cache = (cleanup_count % 3 == 0)
-        
-        # Perform the cleanup
-        print(f"Running scheduled cleanup #{cleanup_count}, clear_streamlit_cache={clear_st_cache}")
-        perform_memory_cleanup(clear_streamlit_cache=clear_st_cache)
+        try:
+            # Use a lock to prevent concurrent access to session state
+            with st.session_state.cleanup_lock:
+                # Check if auto cleanup is enabled
+                if not getattr(st.session_state, 'auto_cleanup', False):
+                    continue
+                
+                cleanup_count += 1
+                # Every 3rd cleanup (30 minutes), do a more aggressive cleanup that includes Streamlit cache
+                clear_st_cache = (cleanup_count % 3 == 0)
+                
+                # Perform the cleanup
+                print(f"Running scheduled cleanup #{cleanup_count}, clear_streamlit_cache={clear_st_cache}")
+                perform_memory_cleanup(clear_streamlit_cache=clear_st_cache)
+        except Exception as e:
+            print(f"Error in auto cleanup thread: {str(e)}")
+            # Sleep for a bit before retrying
+            time.sleep(60)
 
 # --- Memory management ---
 def check_memory_threshold(threshold_mb=2000):
@@ -194,6 +201,10 @@ if 'auto_cleanup' not in st.session_state:
     st.session_state.auto_cleanup = True
 if 'loaded_fiber_ids' not in st.session_state:
     st.session_state.loaded_fiber_ids = []
+if 'maintenance_mode' not in st.session_state:
+    st.session_state.maintenance_mode = False
+if 'cleanup_lock' not in st.session_state:
+    st.session_state.cleanup_lock = threading.Lock()
 
 # Start the auto-cleanup thread
 cleanup_thread = threading.Thread(target=auto_cleanup_thread, daemon=True)
@@ -1193,17 +1204,17 @@ if export_button:
     with st.spinner("Preparing for video export..."):
         # Set quality based on selection
         if export_quality == "Low":
-            frame_count = min(30, num_times)  # Reduced from 50 to 30
-            batch_size = 5  # Reduced batch size
-            img_width, img_height = 640, 480  # Smaller images
+            frame_count = min(30, num_times)
+            batch_size = 5
+            img_width, img_height = 1280, 720  # 720p
         elif export_quality == "Medium":
-            frame_count = min(60, num_times)  # Reduced from 100 to 60
-            batch_size = 10  # Reduced batch size
-            img_width, img_height = 1024, 768  # Medium sized images
+            frame_count = min(60, num_times)
+            batch_size = 10
+            img_width, img_height = 1920, 1080  # 1080p
         else:  # High
-            frame_count = min(100, num_times)  # Reduced from unlimited to max 100
+            frame_count = min(100, num_times)
             batch_size = 20
-            img_width, img_height = 1280, 960  # Moderate high quality
+            img_width, img_height = 2560, 1440  # 1440p
         
         memory_before = get_memory_usage()
         st.info(f"Memory usage before export: {memory_before:.2f} MB")
@@ -1211,8 +1222,7 @@ if export_button:
         try:
             video_filename = os.path.join(st.session_state.temp_dir, f"bearing_video_{freq_selected}Hz.mp4")
             
-            # Create video writer - use minimal quality to save memory
-            # Use imageio.v2 explicitly to avoid deprecation warning
+            # Create video writer
             with imageio.get_writer(video_filename, fps=export_fps, quality=7) as writer:
                 # Process frames in smaller batches to control memory usage
                 num_batches = (frame_count + batch_size - 1) // batch_size
@@ -1244,28 +1254,109 @@ if export_button:
                             if check_memory_critical():
                                 break
                             
-                            # Use the same format as the dashboard display for consistency
-                            magnitudes = find_peak_magnitude_cached(freq_selected, t)
+                            # Create a figure with subplots for all visualizations
+                            fig = make_subplots(
+                                rows=2, cols=2,
+                                specs=[[{"type": "polar", "rowspan": 1}, {"rowspan": 1}],
+                                      [{"colspan": 2}, None]],
+                                subplot_titles=("Bearing Visualization", "FFT Spectrum", "Peak Magnitude History"),
+                                vertical_spacing=0.1,
+                                horizontal_spacing=0.05,
+                                row_heights=[0.5, 0.5]
+                            )
                             
-                            # Create a simple bar plot of magnitudes matching dashboard style
-                            fig = go.Figure()
-                            fig.add_trace(go.Bar(
-                                x=fiber_names,
-                                y=magnitudes,
-                                marker_color='blue'
-                            ))
+                            # Get data for current time step
+                            magnitudes = find_peak_magnitude_cached(freq_selected, t)
+                            max_mag = max(magnitudes) or 1.0
+                            radii = [1 + (m / max_mag) * 1.5 for m in magnitudes]
+                            
+                            # Add bearing visualization (polar plot)
+                            # Add bearing circle
+                            fig.add_trace(
+                                go.Scatterpolar(
+                                    r=[1]*361,
+                                    theta=list(range(361)),
+                                    mode='lines',
+                                    line=dict(color='gray', dash='dot'),
+                                    showlegend=False
+                                ),
+                                row=1, col=1
+                            )
+                            
+                            # Add sensor points and magnitude lines
+                            for idx, (angle, radius, name) in enumerate(zip(fiber_angles_deg, radii, fiber_names)):
+                                # Add magnitude line
+                                fig.add_trace(
+                                    go.Scatterpolar(
+                                        r=[1, radius],
+                                        theta=[angle, angle],
+                                        mode='lines+markers',
+                                        name=name,
+                                        line=dict(color=f'rgb({50+idx*25},{100+idx*20},{150+idx*15})'),
+                                        showlegend=False
+                                    ),
+                                    row=1, col=1
+                                )
+                            
+                            # Add FFT spectrum
+                            for idx, fiber in enumerate(fibers):
+                                fig.add_trace(
+                                    go.Scatter(
+                                        x=freqs,
+                                        y=fiber[:, t],
+                                        name=fiber_names[idx],
+                                        line=dict(color=f'rgb({50+idx*25},{100+idx*20},{150+idx*15})')
+                                    ),
+                                    row=1, col=2
+                                )
+                            
+                            # Add vertical line at selected frequency
+                            fig.add_vline(
+                                x=freq_selected,
+                                line=dict(color="red", width=2, dash="dash"),
+                                row=1, col=2
+                            )
+                            
+                            # Add magnitude history
+                            history_data = get_magnitude_history(freq_selected)
+                            for idx, data in enumerate(history_data):
+                                fig.add_trace(
+                                    go.Scatter(
+                                        x=data['x'][:t+1],
+                                        y=data['y'][:t+1],
+                                        name=data['name'],
+                                        line=data['line']
+                                    ),
+                                    row=2, col=1
+                                )
+                            
+                            # Add vertical line at current time
+                            fig.add_vline(
+                                x=time_formatted[t],
+                                line=dict(color="red", width=2, dash="dash"),
+                                row=2, col=1
+                            )
                             
                             # Update layout
                             fig.update_layout(
-                                title=f"Fiber Magnitudes at {freq_selected} Hz - {time_formatted[t].strftime('%Y-%m-%d %H:%M:%S')}",
-                                xaxis_title="Fiber",
-                                yaxis_title="Magnitude (μ)",
+                                title=f"Ball Bearing @ {freq_selected} Hz - {time_formatted[t].strftime('%Y-%m-%d %H:%M:%S')}",
                                 height=img_height,
                                 width=img_width,
-                                yaxis=dict(
-                                    range=[0, max(magnitudes) * 1.1 if max(magnitudes) > 0 else 200]
+                                showlegend=True,
+                                legend=dict(
+                                    orientation="h",
+                                    yanchor="bottom",
+                                    y=-0.2,
+                                    xanchor="center",
+                                    x=0.5
                                 )
                             )
+                            
+                            # Update axes
+                            fig.update_xaxes(title="Frequency (Hz)", row=1, col=2)
+                            fig.update_yaxes(title="Magnitude", row=1, col=2)
+                            fig.update_xaxes(title="Time", row=2, col=1)
+                            fig.update_yaxes(title="Magnitude", row=2, col=1)
                             
                             # Save frame
                             frame_path = os.path.join(batch_frames_dir, f"frame_{t:04d}.png")
@@ -1275,21 +1366,18 @@ if export_button:
                             fig.data = []
                             fig = None
                             
-                            # Update batch progress
-                            sub_progress = (i + 1) / len(batch_frames)
+                            # Update progress
                             total_progress = (batch_idx * batch_size + i + 1) / frame_count
                             video_progress.progress(total_progress)
                             
-                            # Force garbage collection for every frame in export mode
+                            # Force garbage collection
                             gc.collect()
                     
                     # Add frames to video
                     for t in batch_frames:
                         frame_path = os.path.join(batch_frames_dir, f"frame_{t:04d}.png")
-                        # Read image and add to video
                         img = imageio.imread(frame_path)
                         writer.append_data(img)
-                        # Remove frame after adding to video
                         os.remove(frame_path)
                     
                     # Clean up batch directory
