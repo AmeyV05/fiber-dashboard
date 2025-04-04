@@ -8,7 +8,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 import h5py
 import plotly.io as pio
-import imageio
+import imageio.v2 as imageio
 from io import BytesIO
 import tempfile
 import base64
@@ -17,6 +17,7 @@ import psutil
 import gc
 import threading
 import datetime
+import sys
 
 # Configure Streamlit to minimize memory usage
 try:
@@ -71,16 +72,16 @@ def perform_memory_cleanup(clear_streamlit_cache=False):
         plot_fft_cached.clear()
         get_magnitude_history.clear()
         find_peak_magnitude_cached.clear()
-    except:
-        pass
+    except Exception as e:
+        print(f"Error clearing function caches: {str(e)}")
     
     # Optionally clear all Streamlit cache - use cautiously as this reloads all data
-    if clear_streamlit_cache and before > 3000:  # Only clear if memory usage is very high
+    if clear_streamlit_cache and before > 1500:  # Lower threshold from 3000 to 1500
         try:
             st.cache_data.clear()
             print("Cleared all Streamlit cache due to high memory usage")
-        except:
-            pass
+        except Exception as e:
+            print(f"Error clearing streamlit cache: {str(e)}")
     
     # Clean temporary files that are no longer needed
     temp_dir = st.session_state.temp_dir
@@ -95,7 +96,7 @@ def perform_memory_cleanup(clear_streamlit_cache=False):
                         pass
     
     # Free memory by reducing fiber data size if memory is high
-    if before > 2000 and 'fiber_ids_to_load' in globals():
+    if before > 1000 and 'fiber_ids_to_load' in globals():  # Lower threshold from 2000 to 1000
         # If memory usage is high, try to unload unused fibers
         unloaded_count = 0
         try:
@@ -120,6 +121,30 @@ def perform_memory_cleanup(clear_streamlit_cache=False):
     # Log cleanup in session state
     st.session_state.last_cleanup_time = datetime.datetime.now()
     cleanup_savings = before - after
+    
+    # If cleanup didn't free much memory and usage is still high, try more aggressive approach
+    if cleanup_savings < 10 and after > 1000:
+        print("Initial cleanup didn't free much memory, trying more aggressive approach")
+        # Try to release memory from large dataframes or objects
+        for key in list(st.session_state.keys()):
+            # Skip essential keys
+            if key in ['temp_dir', 'auto_cleanup', 'maintenance_mode', 'last_cleanup_time']:
+                continue
+                
+            # Try to identify large objects that can be safely removed
+            try:
+                obj_size = sys.getsizeof(st.session_state[key]) / (1024 * 1024)  # Size in MB
+                if obj_size > 10:  # If object is larger than 10MB
+                    print(f"Removing large object '{key}' of size {obj_size:.2f}MB")
+                    del st.session_state[key]
+            except:
+                pass
+        
+        # Run GC again
+        gc.collect()
+        final = get_memory_usage()
+        cleanup_savings = before - final
+        after = final
     
     # Log to console for debugging
     print(f"Auto cleanup completed at {st.session_state.last_cleanup_time}. Memory before: {before:.2f}MB, after: {after:.2f}MB, saved: {cleanup_savings:.2f}MB")
@@ -364,25 +389,80 @@ if maintenance_toggle != st.session_state.maintenance_mode:
                 del st.session_state[fiber_id]
         st.session_state.loaded_fiber_ids = []
         gc.collect()
-        st.experimental_rerun()
+        st.rerun()
     else:
         # Exiting maintenance mode - will reload data on next interaction
-        st.experimental_rerun()
+        st.rerun()
 
 # In maintenance mode, show minimal UI and data
 if st.session_state.maintenance_mode:
     st.info("🔧 Low Memory Mode Active - Limited features available")
     st.write("Current memory usage: ", f"{get_memory_usage():.2f} MB")
     
-    # Show minimal controls
-    if st.button("Exit Low Memory Mode"):
-        st.session_state.maintenance_mode = False
-        st.experimental_rerun()
+    # Show minimal controls with more detailed information
+    st.warning("Low Memory Mode reduces functionality to minimize memory usage. Only essential features are available.")
     
-    # Show memory cleanup button
-    if st.button("Clear Memory"):
-        perform_memory_cleanup(clear_streamlit_cache=True)
-        st.success("Memory cleared")
+    # Create columns for better layout
+    col1, col2 = st.columns(2)
+    
+    if col1.button("Exit Low Memory Mode"):
+        st.session_state.maintenance_mode = False
+        st.rerun()
+    
+    # Show memory cleanup button with more options
+    if col2.button("Force Memory Cleanup"):
+        before, after = perform_memory_cleanup(clear_streamlit_cache=True)
+        st.success(f"Memory cleared: {before:.2f}MB → {after:.2f}MB (saved {before-after:.2f}MB)")
+    
+    # Add some diagnostics in low memory mode
+    st.subheader("Memory Diagnostics")
+    
+    # Show loaded objects and their sizes
+    if st.checkbox("Show Session State Objects", value=False):
+        state_info = []
+        for key in st.session_state:
+            try:
+                obj_size = sys.getsizeof(st.session_state[key]) / (1024 * 1024)  # Size in MB
+                state_info.append({"Object": key, "Size (MB)": f"{obj_size:.2f}"})
+            except:
+                state_info.append({"Object": key, "Size": "Unknown"})
+        
+        # Sort by size (largest first)
+        state_info.sort(key=lambda x: float(x["Size (MB)"].replace("Unknown", "0")), reverse=True)
+        
+        # Display as a table
+        st.table(state_info[:20])  # Show top 20 largest objects
+    
+    # Show loaded fibers
+    if st.checkbox("Show Loaded Fiber Data", value=False):
+        st.write(f"Loaded fibers: {len(st.session_state.loaded_fiber_ids)}")
+        st.write(st.session_state.loaded_fiber_ids)
+    
+    # Option to completely reset the app
+    if st.button("⚠️ Reset Application (Clear All Data)"):
+        # Clear all session state except maintenance mode flag
+        maintenance_mode = st.session_state.maintenance_mode
+        temp_dir = st.session_state.temp_dir if 'temp_dir' in st.session_state else None
+        
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        
+        # Restore maintenance mode and temp dir
+        st.session_state.maintenance_mode = maintenance_mode
+        if temp_dir:
+            st.session_state.temp_dir = temp_dir
+        
+        # Clear all caches
+        try:
+            st.cache_data.clear()
+        except:
+            pass
+        
+        # Force garbage collection
+        gc.collect()
+        
+        st.success("Application reset complete. All data cleared from memory.")
+        st.rerun()
     
     # Early exit - don't load or display data
     st.stop()
@@ -431,11 +511,11 @@ if current_memory > 2500:
 memory_indicator.markdown(f"<span style='color:{memory_color};'>Memory: {current_memory:.1f} MB</span>", unsafe_allow_html=True)
 
 # Add a button to enter low memory mode if memory is high
-if current_memory > 2000 and not st.session_state.maintenance_mode:
+if current_memory > 1500 and not st.session_state.maintenance_mode:
     if st.sidebar.button("⚠️ Memory High - Click to Reduce"):
         st.session_state.maintenance_mode = True
         perform_memory_cleanup(clear_streamlit_cache=True)
-        st.experimental_rerun()
+        st.rerun()
 
 # Memory usage info
 if st.sidebar.checkbox("Show Memory Usage", value=False):
@@ -1070,13 +1150,31 @@ def check_memory_critical():
     """Check if memory usage is critical and we need to recover"""
     try:
         memory = get_memory_usage()
-        if memory > 3500:  # Critical memory threshold - 3.5GB
-            st.session_state.out_of_memory = True
+        if memory > 3000:  # Critical threshold - 3GB
+            # For extreme memory conditions, use out_of_memory mode
+            if memory > 3500:  # Extreme critical condition
+                st.session_state.out_of_memory = True
+                # Force reload
+                st.rerun()
+                return True
+            
+            # For high but not extreme, use maintenance mode
+            st.warning("⚠️ Critical memory usage detected. Entering Low Memory Mode to prevent crashes.")
+            # Enable maintenance mode
+            st.session_state.maintenance_mode = True
+            # Clear all caches and perform cleanup
+            perform_memory_cleanup(clear_streamlit_cache=True)
             # Force reload
-            st.experimental_rerun()
+            st.rerun()
             return True
+        elif memory > 2000 and not st.session_state.maintenance_mode:
+            # Perform normal cleanup at high (but not critical) memory usage
+            perform_memory_cleanup(clear_streamlit_cache=False)
+            print(f"Automatic cleanup due to high memory usage: {memory:.2f}MB")
+            return False
         return False
-    except:
+    except Exception as e:
+        print(f"Error in check_memory_critical: {str(e)}")
         return False
 
 # Call this check in key parts of the application
@@ -1098,17 +1196,14 @@ if export_button:
             frame_count = min(30, num_times)  # Reduced from 50 to 30
             batch_size = 5  # Reduced batch size
             img_width, img_height = 640, 480  # Smaller images
-            scale = 1
         elif export_quality == "Medium":
             frame_count = min(60, num_times)  # Reduced from 100 to 60
             batch_size = 10  # Reduced batch size
             img_width, img_height = 1024, 768  # Medium sized images
-            scale = 1.5
         else:  # High
             frame_count = min(100, num_times)  # Reduced from unlimited to max 100
             batch_size = 20
             img_width, img_height = 1280, 960  # Moderate high quality
-            scale = 2
         
         memory_before = get_memory_usage()
         st.info(f"Memory usage before export: {memory_before:.2f} MB")
@@ -1117,6 +1212,7 @@ if export_button:
             video_filename = os.path.join(st.session_state.temp_dir, f"bearing_video_{freq_selected}Hz.mp4")
             
             # Create video writer - use minimal quality to save memory
+            # Use imageio.v2 explicitly to avoid deprecation warning
             with imageio.get_writer(video_filename, fps=export_fps, quality=7) as writer:
                 # Process frames in smaller batches to control memory usage
                 num_batches = (frame_count + batch_size - 1) // batch_size
@@ -1148,17 +1244,11 @@ if export_button:
                             if check_memory_critical():
                                 break
                             
-                            # Use simplified plotting for video export to save memory
-                            # Just capture the essential info in a simple clean plot
+                            # Use the same format as the dashboard display for consistency
+                            magnitudes = find_peak_magnitude_cached(freq_selected, t)
+                            
+                            # Create a simple bar plot of magnitudes matching dashboard style
                             fig = go.Figure()
-                            
-                            # Get magnitudes for this time step
-                            magnitudes = []
-                            for fiber_idx, fiber in enumerate(fibers):
-                                mag = find_peak_magnitude(fiber, t, freq_selected)
-                                magnitudes.append(mag)
-                            
-                            # Create a simple bar plot of magnitudes
                             fig.add_trace(go.Bar(
                                 x=fiber_names,
                                 y=magnitudes,
@@ -1167,16 +1257,19 @@ if export_button:
                             
                             # Update layout
                             fig.update_layout(
-                                title=f"Fiber Magnitudes at {freq_selected} Hz - {time_formatted[t]}",
+                                title=f"Fiber Magnitudes at {freq_selected} Hz - {time_formatted[t].strftime('%Y-%m-%d %H:%M:%S')}",
                                 xaxis_title="Fiber",
-                                yaxis_title="Magnitude",
+                                yaxis_title="Magnitude (μ)",
                                 height=img_height,
-                                width=img_width
+                                width=img_width,
+                                yaxis=dict(
+                                    range=[0, max(magnitudes) * 1.1 if max(magnitudes) > 0 else 200]
+                                )
                             )
                             
                             # Save frame
                             frame_path = os.path.join(batch_frames_dir, f"frame_{t:04d}.png")
-                            fig.write_image(frame_path, width=img_width, height=img_height, scale=scale)
+                            fig.write_image(frame_path, width=img_width, height=img_height)
                             
                             # Close figure to free memory
                             fig.data = []
