@@ -18,6 +18,7 @@ import gc
 import threading
 import datetime
 import sys
+import matplotlib.pyplot as plt
 
 # Configure Streamlit to minimize memory usage
 try:
@@ -151,30 +152,74 @@ def perform_memory_cleanup(clear_streamlit_cache=False):
     return before, after
 
 def auto_cleanup_thread():
-    """Background thread that periodically runs memory cleanup"""
-    cleanup_count = 0
+    """Background thread that periodically checks memory usage and performs cleanup if needed"""
+    print("Auto cleanup thread started")
     while True:
-        # Sleep for 10 minutes (600 seconds)
-        time.sleep(600)
-        
         try:
-            # Use a lock to prevent concurrent access to session state
-            with st.session_state.cleanup_lock:
-                # Check if auto cleanup is enabled
-                if not getattr(st.session_state, 'auto_cleanup', False):
-                    continue
+            # Check if we have the cleanup lock
+            if not hasattr(st.session_state, "cleanup_lock"):
+                print("No cleanup lock found, exiting thread")
+                break
                 
-                cleanup_count += 1
-                # Every 3rd cleanup (30 minutes), do a more aggressive cleanup that includes Streamlit cache
-                clear_st_cache = (cleanup_count % 3 == 0)
+            # Only proceed if auto cleanup is enabled
+            if not st.session_state.auto_cleanup:
+                time.sleep(60)
+                continue
+
+            current_memory = get_memory_usage()
+            print(f"Initial memory usage: {current_memory:.2f} MB")
+
+            # Try basic garbage collection first
+            gc.collect()
+            after_gc = get_memory_usage()
+            print(f"Memory after initial GC: {after_gc:.2f} MB, Saved: {current_memory - after_gc:.2f} MB")
+
+            # If memory is still high, try more aggressive cleanup
+            if after_gc > 2000:  # 2GB threshold
+                print("Initial cleanup didn't free much memory, trying more aggressive approach")
                 
-                # Perform the cleanup
-                print(f"Running scheduled cleanup #{cleanup_count}, clear_streamlit_cache={clear_st_cache}")
-                perform_memory_cleanup(clear_streamlit_cache=clear_st_cache)
+                with st.session_state.cleanup_lock:
+                    before = get_memory_usage()
+                    perform_memory_cleanup()
+                    after = get_memory_usage()
+                    saved = before - after
+                    print(f"Auto cleanup completed at {datetime.datetime.now()}. Memory before: {before:.2f}MB, after: {after:.2f}MB, saved: {saved:.2f}MB")
+                    
+                    if after > 2000:
+                        print(f"Automatic cleanup due to high memory usage: {after:.2f}MB")
+
+            # Sleep for 5 minutes before next check
+            time.sleep(300)
+
         except Exception as e:
             print(f"Error in auto cleanup thread: {str(e)}")
-            # Sleep for a bit before retrying
-            time.sleep(60)
+            time.sleep(60)  # Sleep on error to prevent rapid retries
+
+def perform_memory_cleanup():
+    """Perform aggressive memory cleanup operations"""
+    try:
+        # Clear matplotlib figures
+        plt.close('all')
+        
+        # Clear function caches
+        try:
+            plot_bearing_cached.clear()
+            plot_fft_cached.clear()
+            plot_magnitude_history_cached.clear()
+        except Exception as e:
+            print(f"Error clearing function caches: {str(e)}")
+            
+        # Clear Streamlit cache if memory is very high
+        if get_memory_usage() > 2300:  # 2.3GB threshold
+            print("Cleared all Streamlit cache due to high memory usage")
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            
+        # Force garbage collection
+        gc.collect()
+        
+    except Exception as e:
+        print(f"Error during memory cleanup: {str(e)}")
 
 # --- Memory management ---
 def check_memory_threshold(threshold_mb=2000):
@@ -182,33 +227,33 @@ def check_memory_threshold(threshold_mb=2000):
     current_memory = get_memory_usage()
     if current_memory > threshold_mb:
         print(f"Memory usage {current_memory:.2f}MB exceeds threshold {threshold_mb}MB, performing cleanup")
-        perform_memory_cleanup()
+        with st.session_state.cleanup_lock:
+            perform_memory_cleanup()
         return True
     return False
 
 # --- Session State Initialization ---
-if 'data' not in st.session_state:
+if 'initialized' not in st.session_state:
+    # Initialize all required session state variables
+    st.session_state.initialized = True
     st.session_state.data = None
-if 'download_complete' not in st.session_state:
     st.session_state.download_complete = False
-if 'temp_dir' not in st.session_state:
     st.session_state.temp_dir = tempfile.mkdtemp()
-if 'memory_usage' not in st.session_state:
     st.session_state.memory_usage = []
-if 'last_cleanup_time' not in st.session_state:
     st.session_state.last_cleanup_time = datetime.datetime.now()
-if 'auto_cleanup' not in st.session_state:
     st.session_state.auto_cleanup = True
-if 'loaded_fiber_ids' not in st.session_state:
     st.session_state.loaded_fiber_ids = []
-if 'maintenance_mode' not in st.session_state:
     st.session_state.maintenance_mode = False
-if 'cleanup_lock' not in st.session_state:
     st.session_state.cleanup_lock = threading.Lock()
+    st.session_state.cleanup_thread = None
+    st.session_state.out_of_memory = False
+    st.session_state.animate = False
 
-# Start the auto-cleanup thread
-cleanup_thread = threading.Thread(target=auto_cleanup_thread, daemon=True)
-cleanup_thread.start()
+# Start the auto-cleanup thread only if it hasn't been started
+if st.session_state.cleanup_thread is None or not st.session_state.cleanup_thread.is_alive():
+    st.session_state.cleanup_thread = threading.Thread(target=auto_cleanup_thread, daemon=True)
+    st.session_state.cleanup_thread.start()
+    print("Started new auto-cleanup thread")
 
 # --- File download ---
 @st.cache_data(ttl=24*3600, max_entries=1)
@@ -609,7 +654,7 @@ def find_peak_magnitude(fft_data, time_idx, freq_target, window=0.2):
     return 0
 
 # --- Polar Fiber Angles (from original script) ---
-fiber_angles_deg = [270, 306, 342, 18, 90, 126, 162, 198]
+fiber_angles_deg = [315, 360, 45, 90, 135, 180, 225, 270]
 fiber_angles_rad = np.radians(fiber_angles_deg)
 
 # --- Plot Functions ---
