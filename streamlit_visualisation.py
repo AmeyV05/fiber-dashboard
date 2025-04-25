@@ -19,6 +19,7 @@ import threading
 import datetime
 import sys
 import matplotlib.pyplot as plt
+import scipy.interpolate
 
 # Configure Streamlit to minimize memory usage
 try:
@@ -38,7 +39,7 @@ except ImportError:
     stqdm = lambda x, **kwargs: x
 
 # --- CONFIG ---
-FILE_URL = "https://etprojects.blob.core.windows.net/fiber-processed-test/fiber_all_processed.h5"
+FILE_URL = "https://etprojects.blob.core.windows.net/fiber-processed-test/fiber_fft_all_processed.h5"
 
 # --- PAGE CONFIG ---
 st.set_page_config(layout="wide")
@@ -69,7 +70,7 @@ def perform_memory_cleanup(clear_streamlit_cache=False):
     
     # Clear cache for heavyweight cached functions
     try:
-        plot_bearing_cached.clear()
+        plot_bearing_animated_cached.clear()
         plot_fft_cached.clear()
         get_magnitude_history.clear()
         find_peak_magnitude_cached.clear()
@@ -102,7 +103,8 @@ def perform_memory_cleanup(clear_streamlit_cache=False):
         unloaded_count = 0
         try:
             # Only keep currently visible fibers in memory
-            visible_fibers = [f'fft_fiber_1_{i}' for i in range(1, 5)] + [f'fft_fiber_2_{i}' for i in range(1, 5)]
+            visible_fibers = [f'fft_fiber_1_{i}_mags' for i in range(1, 5)] + [f'fft_fiber_2_{i}_mags' for i in range(1, 5)] + \
+                            [f'fft_fiber_1_{i}_phases' for i in range(1, 5)] + [f'fft_fiber_2_{i}_phases' for i in range(1, 5)]
             for fiber_id in st.session_state.loaded_fiber_ids[:]:
                 if fiber_id not in visible_fibers:
                     # Remove from session state
@@ -203,7 +205,7 @@ def perform_memory_cleanup():
         
         # Clear function caches
         try:
-            plot_bearing_cached.clear()
+            plot_bearing_animated_cached.clear()
             plot_fft_cached.clear()
             plot_magnitude_history_cached.clear()
         except Exception as e:
@@ -323,7 +325,7 @@ def load_minimal_data(file_path):
             # List available fibers but don't load them yet
             available_fibers = []
             for key in file.keys():
-                if key.startswith('fft_fiber'):
+                if key.startswith('fft_fiber') and ('_mags' in key or '_phases' in key):
                     available_fibers.append(key)
             
             fiber_data['available_fibers'] = available_fibers
@@ -394,8 +396,10 @@ data = st.session_state.data
 time_vector = data['time_vector']
 freqs = data['freqs']
 
-# Get fiber IDs to be loaded
-fiber_ids_to_load = [f'fft_fiber_1_{i}' for i in range(1, 5)] + [f'fft_fiber_2_{i}' for i in range(1, 5)]
+# Get fiber IDs to be loaded (now with both mags and phases)
+fiber_mags_ids_to_load = [f'fft_fiber_1_{i}_mags' for i in range(1, 5)] + [f'fft_fiber_2_{i}_mags' for i in range(1, 5)]
+fiber_phases_ids_to_load = [f'fft_fiber_1_{i}_phases' for i in range(1, 5)] + [f'fft_fiber_2_{i}_phases' for i in range(1, 5)]
+fiber_ids_to_load = fiber_mags_ids_to_load + fiber_phases_ids_to_load
 fiber_names = [f'1_{i}' for i in range(1, 5)] + [f'2_{i}' for i in range(1, 5)]
 
 # Load fibers on demand
@@ -414,8 +418,9 @@ with st.spinner("Loading fiber data..."):
         # Perform cleanup after loading
         gc.collect()
 
-# Create fiber list using references to session state to avoid duplication
-fibers = [st.session_state[f_id] for f_id in fiber_ids_to_load]
+# Create fiber lists using references to session state to avoid duplication
+fibers_mags = [st.session_state[f_id] for f_id in fiber_mags_ids_to_load]
+fibers_phases = [st.session_state[f_id] for f_id in fiber_phases_ids_to_load]
 
 # --- Process Time ---
 if time_vector[0] > 1e17:
@@ -428,7 +433,7 @@ num_times = len(time_vector)
 if 'maintenance_mode' not in st.session_state:
     st.session_state.maintenance_mode = False
 
-# Sidebar header
+# --- Sidebar header ---
 st.sidebar.header("Visualization Controls")
 
 # Only show this option in the sidebar at the top
@@ -501,7 +506,12 @@ if st.session_state.maintenance_mode:
         temp_dir = st.session_state.temp_dir if 'temp_dir' in st.session_state else None
         
         for key in list(st.session_state.keys()):
-            del st.session_state[key]
+            if key not in ['out_of_memory', 'temp_dir', 'auto_cleanup']:
+                try:
+                    del st.session_state[key]
+                except Exception as e:
+                    print(f"Error deleting session state key {key}: {str(e)}")
+                    pass
         
         # Restore maintenance mode and temp dir
         st.session_state.maintenance_mode = maintenance_mode
@@ -511,7 +521,8 @@ if st.session_state.maintenance_mode:
         # Clear all caches
         try:
             st.cache_data.clear()
-        except:
+        except Exception as e:
+            print(f"Error clearing cache: {str(e)}")
             pass
         
         # Force garbage collection
@@ -523,25 +534,18 @@ if st.session_state.maintenance_mode:
     # Early exit - don't load or display data
     st.stop()
 
-# --- UI: Dropdown + Sliders --- (after maintenance mode check)
+# --- UI: Dropdown + Sliders ---
 freqs_to_plot = [18.7, 37.4, 56, 57.6, 76.5, 115.6]
 freq_selected = st.sidebar.selectbox("Select Frequency (Hz)", freqs_to_plot, index=1)
 
-# Add animation speed control
-animation_speed = st.sidebar.slider("Animation Speed", min_value=0.01, max_value=1.0, value=0.2, step=0.01)
+# --- Animation speed control ---
+animation_fps = st.sidebar.slider("Animation FPS", min_value=2, max_value=10, value=5, step=1)
 
-# Time index slider for manual control
+# --- Time index slider for manual control ---
 time_idx = st.sidebar.slider("Time Index", min_value=0, max_value=num_times-1, value=0)
 
-# Animation options
-col1, col2 = st.sidebar.columns(2)
-start_button = col1.button("Start Animation")
-stop_button = col2.button("Stop Animation")
-
-# Export options
-export_button = st.sidebar.button("Export Video")
-export_quality = st.sidebar.select_slider("Video Quality", options=["Low", "Medium", "High"], value="Medium")
-export_fps = st.sidebar.slider("Frames per Second", min_value=1, max_value=30, value=5)
+# --- Display selected time ---
+st.sidebar.info(f"Selected Time: {time_formatted[time_idx].strftime('%Y-%m-%d %H:%M:%S')}")
 
 # Add a memory usage meter in the sidebar that updates every 10 seconds
 if 'last_memory_update_time' not in st.session_state:
@@ -592,16 +596,6 @@ if st.sidebar.checkbox("Show Memory Usage", value=False):
         before, after = perform_memory_cleanup()
         st.sidebar.success(f"Memory cleanup complete. Before: {before:.2f} MB, After: {after:.2f} MB, Saved: {before - after:.2f} MB")
 
-if 'animate' not in st.session_state:
-    st.session_state.animate = False
-
-if start_button:
-    st.session_state.animate = True
-if stop_button:
-    st.session_state.animate = False
-    # Force garbage collection when animation stops
-    gc.collect()
-
 # --- Helper functions ---
 def safe_max(arr):
     """Safely get maximum value from array, handling empty or all-nan arrays"""
@@ -619,182 +613,59 @@ def safe_max(arr):
 # --- Helper: Peak Magnitude ---
 @st.cache_data(ttl=300, max_entries=20)
 def find_peak_magnitude_cached(freq_target, time_idx, window=0.2):
-    results = []
-    for fiber in fibers:
-        if fiber is None:
-            results.append(0)
+    mag_results = []
+    phase_results = []
+    
+    for i, (fiber_mag, fiber_phase) in enumerate(zip(fibers_mags, fibers_phases)):
+        if fiber_mag is None or fiber_phase is None:
+            mag_results.append(0)
+            phase_results.append(0)
             continue
             
         try:
             indices = np.where((freqs >= freq_target - window) & (freqs <= freq_target + window))[0]
             if indices.size > 0:
-                peak_vals = fiber[indices, time_idx]
-                max_idx = np.argmax(peak_vals)
-                results.append(peak_vals[max_idx])
+                # Get magnitude values at the frequency range
+                mag_vals = fiber_mag[indices, time_idx]
+                max_idx = np.argmax(mag_vals)
+                mag_results.append(mag_vals[max_idx])
+                
+                # Get the corresponding phase value at the same index
+                phase_vals = fiber_phase[indices, time_idx]
+                phase_results.append(phase_vals[max_idx])
             else:
-                results.append(0)
+                mag_results.append(0)
+                phase_results.append(0)
         except Exception as e:
             print(f"Error in find_peak_magnitude_cached: {str(e)}")
-            results.append(0)
-    return results
+            mag_results.append(0)
+            phase_results.append(0)
+            
+    return mag_results, phase_results
 
-def find_peak_magnitude(fft_data, time_idx, freq_target, window=0.2):
-    if fft_data is None:
-        return 0
+def find_peak_magnitude(fft_data_mag, fft_data_phase, time_idx, freq_target, window=0.2):
+    if fft_data_mag is None or fft_data_phase is None:
+        return 0, 0
         
     try:
         indices = np.where((freqs >= freq_target - window) & (freqs <= freq_target + window))[0]
         if indices.size > 0:
-            peak_vals = fft_data[indices, time_idx]
-            max_idx = np.argmax(peak_vals)
-            return peak_vals[max_idx]
+            mag_vals = fft_data_mag[indices, time_idx]
+            max_idx = np.argmax(mag_vals)
+            phase_val = fft_data_phase[indices[max_idx], time_idx]
+            return mag_vals[max_idx], phase_val
     except Exception as e:
         print(f"Error in find_peak_magnitude: {str(e)}")
     
-    return 0
+    return 0, 0
 
-# --- Polar Fiber Angles (from original script) ---
-fiber_angles_deg = [315, 360, 45, 90, 135, 180, 225, 270]
-fiber_angles_rad = np.radians(fiber_angles_deg)
-
-# --- Plot Functions ---
-@st.cache_data(ttl=60, max_entries=10)
-def plot_bearing_cached(time_idx, freq_selected):
-    magnitudes = find_peak_magnitude_cached(freq_selected, time_idx)
-    max_mag = max(magnitudes) or 1.0
-    radii = [1 + (m / max_mag) * 1.5 for m in magnitudes]
-
-    fig = go.Figure()
-
-    # Bearing circle
-    fig.add_trace(go.Scatterpolar(
-        r=[1]*361,
-        theta=list(range(361)),
-        mode='lines',
-        line=dict(color='gray', dash='dot'),
-        showlegend=False))
-
-    # Sensor locations
-    fig.add_trace(go.Scatterpolar(
-        r=[1]*len(fiber_angles_deg),
-        theta=fiber_angles_deg,
-        mode='markers+text',
-        marker=dict(size=10, color='blue'),
-        text=[f"{name}" for name in fiber_names],
-        textposition='top center',
-        showlegend=False))
-
-    # FFT magnitude lines
-    for i in range(len(fiber_angles_rad)):
-        fig.add_trace(go.Scatterpolar(
-            r=[1, radii[i]],
-            theta=[np.degrees(fiber_angles_rad[i])]*2,
-            mode='lines',
-            line=dict(color='green', width=2),
-            showlegend=False))
-
-    # Add a colored heatmap on the circle based on magnitude
-    theta_interp = np.linspace(0, 2*np.pi, 100)
-    
-    # Convert points to cartesian for interpolation
-    points = np.array([np.cos(fiber_angles_rad) * radii, np.sin(fiber_angles_rad) * radii]).T
-    
-    # Debug print to verify point order
-    point_order = []
-    for i, (angle, r) in enumerate(zip(fiber_angles_deg, radii)):
-        point_order.append(f"{fiber_names[i]}: {angle}° ({r:.2f})")
-    
-    # Add direct lines connecting the points in order (no interpolation)
-    # This shows the raw sensor data connection
-    ordered_thetas = fiber_angles_deg.copy()
-    ordered_rs = radii.copy()
-    # Add first point at the end to close the loop
-    ordered_thetas.append(fiber_angles_deg[0])
-    ordered_rs.append(radii[0])
-    
-    fig.add_trace(go.Scatterpolar(
-        r=ordered_rs,
-        theta=ordered_thetas,
-        mode='lines',
-        line=dict(color='blue', width=2, dash='dot'),
-        name="Raw Data",
-        showlegend=False
-    ))
-    
-    # Only interpolate if we have enough unique points and valid data
-    if len(np.unique(points, axis=0)) >= 3 and not np.isnan(points).any():
-        try:
-            # Add the first point to the end of the points array for a closed curve
-            points_closed = np.vstack((points, points[0]))
-            
-            # Use periodic boundary condition for a closed curve
-            tck, u = splprep([points_closed[:, 0], points_closed[:, 1]], s=0, per=True)
-            
-            # Use more points for smoother interpolation
-            interp_points = 200
-            t = np.linspace(0, 1, interp_points)
-            xi, yi = splev(t, tck)
-            
-            # Convert back to polar coordinates
-            r_interp = np.sqrt(xi**2 + yi**2)
-            theta_interp_deg = np.degrees(np.arctan2(yi, xi)) % 360
-            
-            # Sort by theta for proper line drawing
-            sort_idx = np.argsort(theta_interp_deg)
-            theta_interp_deg = theta_interp_deg[sort_idx]
-            r_interp = r_interp[sort_idx]
-            
-            # Add interpolated line
-            fig.add_trace(go.Scatterpolar(
-                r=r_interp,
-                theta=theta_interp_deg,
-                mode='lines',
-                line=dict(color='rgba(255,0,0,0.5)', width=3),
-                fill='toself',
-                fillcolor='rgba(255,0,0,0.1)',
-                showlegend=False))
-            
-            # Show the actual interpolation points to visualize how the spline is constructed
-            # Take 8 evenly spaced points from the interpolation (matching number of original points)
-            sample_indices = np.linspace(0, interp_points-1, len(fiber_angles_deg), dtype=int)
-            sample_r = [r_interp[i] for i in sample_indices]
-            sample_theta = [theta_interp_deg[i] for i in sample_indices]
-            
-            fig.add_trace(go.Scatterpolar(
-                r=sample_r,
-                theta=sample_theta,
-                mode='markers',
-                marker=dict(size=8, color='red'),
-                showlegend=False
-            ))
-        except Exception as e:
-            # If interpolation fails, just skip it without crashing
-            print(f"Interpolation skipped: {str(e)}")
-            pass
-
-    fig.update_layout(
-        polar=dict(
-            radialaxis=dict(visible=False, range=[0, 3]),
-            angularaxis=dict(tickfont=dict(size=10))
-        ),
-        margin=dict(t=50, l=0, r=0, b=0),
-        title=dict(
-            text=f"Ball Bearing @ {freq_selected} Hz<br>{time_formatted[time_idx].strftime('%H:%M:%S')}",
-            font=dict(size=16)
-        ),
-        height=400
-    )
-    return fig
-
-def plot_bearing(time_idx, freq_selected):
-    return plot_bearing_cached(time_idx, freq_selected)
-
+# --- FFT Plot Function ---
 @st.cache_data(ttl=60, max_entries=10)
 def plot_fft_cached(time_idx, freq_selected):
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
     
     fig = go.Figure()
-    for i, fiber in enumerate(fibers):
+    for i, fiber in enumerate(fibers_mags):
         fig.add_trace(go.Scatter(
             x=freqs, 
             y=fiber[:, time_idx], 
@@ -814,16 +685,19 @@ def plot_fft_cached(time_idx, freq_selected):
     )
     return fig
 
-def plot_fft(time_idx):
-    return plot_fft_cached(time_idx, freq_selected)
-
+# --- Magnitude History Plot Function ---
 @st.cache_data(ttl=60, max_entries=5)
 def get_magnitude_history(freq_selected):
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
     
     data = []
-    for i, fiber in enumerate(fibers):
-        mags = [find_peak_magnitude(fiber, t, freq_selected) for t in range(num_times)]
+    for i, fiber_mag in enumerate(fibers_mags):
+        fiber_phase = fibers_phases[i]
+        mags = []
+        for t in range(num_times):
+            mag, _ = find_peak_magnitude(fiber_mag, fiber_phase, t, freq_selected)
+            mags.append(mag)
+            
         data.append({
             'x': time_formatted,
             'y': mags,
@@ -859,601 +733,265 @@ def plot_magnitude_history(time_idx, freq_selected):
     )
     return fig
 
-# --- Create layout ---
-st.subheader(f"Visualization for {freq_selected} Hz")
-col_bearing, col_fft = st.columns(2)
-col_history = st.container()
+# --- Polar Fiber Angles (from original script) ---
+fiber_angles_deg = [315, 360, 45, 90, 135, 180, 225, 270]
+fiber_angles_rad = np.radians(fiber_angles_deg)
 
-placeholder_bearing = col_bearing.empty()
-placeholder_fft = col_fft.empty()
-placeholder_history = col_history.empty()
+# --- Animated Bearing Plot ---
+@st.cache_data(ttl=60, max_entries=10)
+def plot_bearing_animated_cached(time_idx, freq_selected, fps=30):
+    # Get magnitude and phase values at the selected frequency and time
+    magnitudes, phases = find_peak_magnitude_cached(freq_selected, time_idx)
+    
+    # Get timestamp for the title
+    timestamp = time_formatted[time_idx].strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Create the animated bearing plot
+    fig = create_animated_bearing(magnitudes, phases, freq_selected, fps=fps, timestamp=timestamp)
+    
+    return fig
 
-# --- Animation Function ---
-def create_animation_frames(freq_selected, max_frames=None, quality="Medium"):
-    # Create a temp directory for frames
-    frames_dir = os.path.join(st.session_state.temp_dir, "frames")
-    os.makedirs(frames_dir, exist_ok=True)
-    frame_paths = []
+def create_animated_bearing(magnitudes, phases, freq_selected, fps=5, timestamp=None):
+    """
+    Create an animated bearing plot where each fiber location 
+    shows a sinusoidal signal x(t) = A sin(wt+phi) over one cycle period T = 1/f
+    """
+    # Create base figure
+    fig = go.Figure()
     
-    # Set image resolution based on quality
-    if quality == "Low":
-        img_width, img_height = 800, 600
-    elif quality == "Medium":
-        img_width, img_height = 1200, 900
-    else:  # High
-        img_width, img_height = 1920, 1080
+    # Calculate period T = 1/f for one complete cycle
+    T = 1.0 / freq_selected
     
-    frame_count = num_times if max_frames is None else min(max_frames, num_times)
+    # Create time vector with 100 points over one period
+    num_points = 100
+    tvec = np.linspace(0, 2*T, num_points)
     
-    # Create a consistent color sequence
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
-    
-    # Get magnitude history data for all fibers (reused across frames)
-    magnitude_history_data = get_magnitude_history(freq_selected)
-    
-    # Pre-compute y-axis ranges for consistent scaling
-    max_fft_value = 0
-    max_history_value = 0
-    
-    # Find max values for consistent scaling
-    for i, fiber in enumerate(fibers):
-        max_fft_value = max(max_fft_value, np.max(fiber[:, :frame_count]))
-        history_values = [find_peak_magnitude(fiber, t, freq_selected) for t in range(frame_count)]
-        max_history_value = max(max_history_value, max(history_values) if history_values else 0)
-    
-    # Add small padding to max values and ensure minimum scale
-    max_fft_value = max(max_fft_value * 1.1, 0.05)  # Ensure minimum y-scale for visibility
-    max_history_value *= 1.1
-    
-    # Determine consistent x-axis range for FFT spectrum
-    max_freq_to_show = min(450, max(freqs))
-    
-    # Create a progress bar and status for frame generation
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    # Only load necessary data into memory
-    for t in stqdm(range(frame_count), desc="Generating frames"):
-        # Update progress
-        progress = int((t + 1) / frame_count * 100)
-        progress_bar.progress(progress / 100)
-        status_text.text(f"Generating frame {t+1}/{frame_count} ({progress}%)")
+    # Create frames for the animation - we'll show the full cycle regardless of fps
+    frames = []
+    for frame_idx, t in enumerate(tvec):
+        # Calculate current radial values based on sine wave formula
+        radii = []
+        for mag, phase in zip(magnitudes, phases):
+            # x(t) = A sin(wt + phi) where t goes from 0 to T
+            val = mag * np.sin(2 * np.pi * freq_selected * t + phase)
+            # Scale to ensure positive values and normalize with max magnitude
+            max_mag = max(magnitudes) or 1.0
+            scaled_val = 1 + ((val + mag) / (2 * max_mag)) * 1.5
+            radii.append(scaled_val)
         
-        # Create a new figure for each frame to avoid memory build-up
-        fig = make_subplots(
-            rows=2, cols=2,
-            specs=[[{"type": "polar", "rowspan": 1}, {"rowspan": 1}],
-                   [{"colspan": 2}, None]],
-            subplot_titles=("Bearing Visualization", "FFT Spectrum", "Magnitude History"),
-            vertical_spacing=0.1,
-            horizontal_spacing=0.05,
-            row_heights=[0.5, 0.5]
-        )
-        
-        # Similar to static plot functions but optimized for animation
-        # Bearing plot (row 1, col 1) - polar plot
-        magnitudes = []
-        for fiber_idx, fiber in enumerate(fibers):
-            # Calculate magnitude for current time step
-            mag = find_peak_magnitude(fiber, t, freq_selected)
-            magnitudes.append(mag)
-        
-        # Scale magnitudes for visualization
-        max_mag = max(magnitudes) or 1.0
-        radii = [1 + (m / max_mag) * 1.5 for m in magnitudes]
+        # Create frame data
+        frame_data = []
         
         # Add bearing circle
-        fig.add_trace(
+        frame_data.append(
             go.Scatterpolar(
                 r=[1]*361,
-                theta=np.linspace(0, 360, 361),
+                theta=list(range(361)),
                 mode='lines',
-                line=dict(color='gray', width=1),
+                line=dict(color='gray', dash='dot'),
                 showlegend=False
-            ),
-            row=1, col=1
+            )
         )
         
-        # Add fiber magnitudes
-        for i, (r, ang, name) in enumerate(zip(radii, fiber_angles_deg, fiber_names)):
-            # Plot fiber magnitude as line from center
-            fig.add_trace(
+        # Add sensor locations with smaller blue dots
+        frame_data.append(
+            go.Scatterpolar(
+                r=[1]*len(fiber_angles_deg),
+                theta=fiber_angles_deg,
+                mode='markers+text',
+                marker=dict(size=8, color='blue'),
+                text=[f"{name}" for name in fiber_names],
+                textposition='top center',
+                showlegend=False
+            )
+        )
+        
+        # Add magnitude lines in green
+        for i in range(len(fiber_angles_rad)):
+            frame_data.append(
                 go.Scatterpolar(
-                    r=[0, r],
-                    theta=[ang, ang],
-                    mode='lines+markers',
-                    name=f"Fiber {name}",
-                    line=dict(color=colors[i % len(colors)], width=2),
-                    marker=dict(size=[0, 8]),
-                ),
-                row=1, col=1
-            )
-        
-        # FFT Plot (row 1, col 2)
-        # Plot each fiber's FFT at the current time step
-        for i, fiber in enumerate(fibers):
-            # Plot subset of frequency range to improve performance
-            plot_freqs = freqs[freqs <= max_freq_to_show]
-            plot_values = fiber[freqs <= max_freq_to_show, t]
-            
-            fig.add_trace(
-                go.Scatter(
-                    x=plot_freqs,
-                    y=plot_values,
-                    name=f"Fiber {fiber_names[i]}",
-                    line=dict(color=colors[i % len(colors)], width=1),
+                    r=[1, radii[i]],
+                    theta=[np.degrees(fiber_angles_rad[i])]*2,
+                    mode='lines',
+                    line=dict(color='green', width=2),
                     showlegend=False
-                ),
-                row=1, col=2
+                )
             )
         
-        # Add vertical line at selected frequency
-        fig.add_vline(
-            x=freq_selected,
-            line=dict(color="red", width=2, dash="dash"),
-            row=1, col=2
-        )
+        # Add direct lines connecting the points in order (dotted blue line)
+        ordered_thetas = fiber_angles_deg.copy()
+        ordered_rs = radii.copy()
+        # Add first point at the end to close the loop
+        ordered_thetas.append(fiber_angles_deg[0])
+        ordered_rs.append(radii[0])
         
-        # Add a more visible point at the peak frequency for each fiber
-        for i, fiber in enumerate(fibers):
-            # Get the peak value around the selected frequency
-            peak_value = find_peak_magnitude(fiber, t, freq_selected)
-            # Highlight the peak with a marker
-            if peak_value > 0:
-                freq_indices = np.where((freqs >= freq_selected - 0.2) & (freqs <= freq_selected + 0.2))[0]
-                if len(freq_indices) > 0:
-                    max_idx = np.argmax(fiber[freq_indices, t])
-                    peak_freq = freqs[freq_indices[max_idx]]
-                    fig.add_trace(
-                        go.Scatter(
-                            x=[peak_freq],
-                            y=[peak_value],
-                            mode='markers',
-                            marker=dict(size=10, color=colors[i % len(colors)]),
-                            showlegend=False
-                        ),
-                        row=1, col=2
-                    )
-        
-        # Add traces for history plot with explicit colors
-        for i, data_item in enumerate(magnitude_history_data):
-            fig.add_trace(
-                go.Scatter(
-                    x=data_item['x'],
-                    y=data_item['y'],
-                    name=data_item['name'],
-                    line=data_item['line']
-                ),
-                row=2, col=1
+        frame_data.append(
+            go.Scatterpolar(
+                r=ordered_rs,
+                theta=ordered_thetas,
+                mode='lines',
+                line=dict(color='blue', width=2, dash='dot'),
+                showlegend=False
             )
-        
-        # Add vertical line at current time on history plot
-        current_time = time_formatted[t]
-        fig.add_shape(
-            type="line",
-            x0=current_time,
-            y0=0,
-            x1=current_time,
-            y1=1,
-            yref="paper",
-            xref="x3",
-            line=dict(color="red", width=2, dash="dash"),
-            row=2, col=1
         )
         
-        # Update layout for consistent appearance
-        fig.update_layout(
-            title={
-                'text': f"Ball Bearing FFT at {time_formatted[t]}",
-                'y':0.95,
-                'x':0.5,
-                'xanchor': 'center',
-                'yanchor': 'top'
-            },
-            polar={
-                'radialaxis': {'range': [0, 3], 'showticklabels': False, 'ticks': ''},
-                'angularaxis': {'direction': 'clockwise', 'rotation': 90}
-            },
-            showlegend=True,
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=-0.2,
-                xanchor="center",
-                x=0.5
-            ),
-            autosize=True,
-            margin=dict(l=30, r=30, t=50, b=30),
-            height=img_height,
-            width=img_width
-        )
+        # Convert points to cartesian for interpolation
+        points = np.array([np.cos(fiber_angles_rad) * radii, 
+                          np.sin(fiber_angles_rad) * radii]).T
         
-        # Update y-axis range for FFT plot for consistent scaling
-        fig.update_yaxes(range=[0, max_fft_value], row=1, col=2)
-        
-        # Update y-axis range for history plot for consistent scaling
-        fig.update_yaxes(range=[0, max_history_value], row=2, col=1)
-        
-        # Update x-axis range for FFT plot
-        fig.update_xaxes(range=[0, max_freq_to_show], title="Frequency (Hz)", row=1, col=2)
-        
-        # Update x-axis for history plot
-        fig.update_xaxes(title="Time", row=2, col=1)
-        fig.update_yaxes(title="Magnitude", row=2, col=1)
-        
-        # Update polar axis for bearing plot
-        fig.update_layout(
-            polar={
-                'radialaxis': {'range': [0, 3], 'showticklabels': False, 'ticks': ''},
-                'angularaxis': {'direction': 'clockwise', 'rotation': 90}
-            },
-        )
-        
-        # Update axes labels and styles
-        fig.update_yaxes(title="Magnitude", row=1, col=2)
-        fig.update_xaxes(title="Frequency (Hz)", row=1, col=2)
-        fig.update_xaxes(title="Time", row=2, col=1)
-        fig.update_yaxes(title="Magnitude", row=2, col=1)
-        
-        fig.update_xaxes(showticklabels=True, showgrid=True, zeroline=True, row=1, col=2)
-        fig.update_yaxes(showticklabels=True, showgrid=True, zeroline=True, row=1, col=2)
-        fig.update_xaxes(showticklabels=True, showgrid=True, zeroline=True, row=2, col=1)
-        fig.update_yaxes(showticklabels=True, showgrid=True, zeroline=True, row=2, col=1)
-        
-        # Save frame to disk with higher quality
-        frame_path = os.path.join(frames_dir, f"frame_{t:04d}.png")
-        fig.write_image(frame_path, width=img_width, height=img_height, scale=2)  # scale=2 for higher resolution
-        frame_paths.append(frame_path)
-        
-        # Close figure to free memory
-        fig.data = []
-        fig = None
-        
-        # Force garbage collection periodically
-        if t % 5 == 0:
-            gc.collect()
-    
-    # Clear progress indicators
-    progress_bar.empty()
-    status_text.empty()
-    
-    return frame_paths, frames_dir
-
-# Function to create a download link for the generated video
-def get_binary_file_downloader_html(bin_file, file_label='File'):
-    with open(bin_file, 'rb') as f:
-        data = f.read()
-    b64 = base64.b64encode(data).decode()
-    href = f'<a href="data:application/octet-stream;base64,{b64}" download="{os.path.basename(bin_file)}">Download {file_label}</a>'
-    return href
-
-# --- Live Animation ---
-if st.session_state.animate:
-    t = time_idx
-    animation_cycle = 0  # Initialize a cycle counter
-    memory_check_counter = 0  # Counter for memory checks
-    while st.session_state.animate:
-        fig_bearing = plot_bearing(t, freq_selected)
-        fig_fft = plot_fft(t)
-        fig_hist = plot_magnitude_history(t, freq_selected)
-
-        # Use unique keys for each frame, including the animation cycle
-        placeholder_bearing.plotly_chart(fig_bearing, use_container_width=True, key=f"bearing_{t}_{freq_selected}_{animation_cycle}")
-        placeholder_fft.plotly_chart(fig_fft, use_container_width=True, key=f"fft_{t}_{freq_selected}_{animation_cycle}")
-        placeholder_history.plotly_chart(fig_hist, use_container_width=True, key=f"hist_{t}_{freq_selected}_{animation_cycle}")
-
-        t += 1
-        memory_check_counter += 1
-        
-        # Check memory usage every 5 frames
-        if memory_check_counter >= 5:
-            memory_check_counter = 0
-            check_memory_threshold(1500)  # Lower threshold to be more proactive
-        
-        if t >= num_times:
-            t = 0  # Reset to the beginning for looping
-            animation_cycle += 1  # Increment the cycle counter
-            # Force garbage collection at the end of each cycle
-            gc.collect()
-        time.sleep(animation_speed)
-
-# Show static plots based on slider when not animating
-else:
-    fig_bearing = plot_bearing(time_idx, freq_selected)
-    fig_fft = plot_fft(time_idx)
-    fig_hist = plot_magnitude_history(time_idx, freq_selected)
-
-    placeholder_bearing.plotly_chart(fig_bearing, use_container_width=True, key="static_bearing")
-    placeholder_fft.plotly_chart(fig_fft, use_container_width=True, key="static_fft")
-    placeholder_history.plotly_chart(fig_hist, use_container_width=True, key="static_history")
-
-# Add a recovery mechanism in case app runs out of memory
-if 'out_of_memory' not in st.session_state:
-    st.session_state.out_of_memory = False
-
-# Check if we're in recovery mode
-if st.session_state.out_of_memory:
-    st.error("The application ran out of memory. We've cleared caches and reset data to recover.")
-    
-    # Clear all data
-    for key in list(st.session_state.keys()):
-        if key not in ['out_of_memory', 'temp_dir', 'auto_cleanup']:
+        # Only interpolate if we have enough unique points and valid data
+        if len(np.unique(points, axis=0)) >= 3 and not np.isnan(points).any():
             try:
-                del st.session_state[key]
-            except:
+                # Add the first point to the end of the points array for a closed curve
+                points_closed = np.vstack((points, points[0]))
+                
+                # Use periodic boundary condition for a closed curve
+                tck, u = splprep([points_closed[:, 0], points_closed[:, 1]], s=0, per=True)
+                
+                # Use more points for smoother interpolation
+                interp_points = 200
+                t_interp = np.linspace(0, 1, interp_points)
+                xi, yi = splev(t_interp, tck)
+                
+                # Convert back to polar coordinates
+                r_interp = np.sqrt(xi**2 + yi**2)
+                theta_interp_deg = np.degrees(np.arctan2(yi, xi)) % 360
+                
+                # Sort by theta for proper line drawing
+                sort_idx = np.argsort(theta_interp_deg)
+                theta_interp_deg = theta_interp_deg[sort_idx]
+                r_interp = r_interp[sort_idx]
+                
+                # Add interpolated line with fill
+                frame_data.append(
+                    go.Scatterpolar(
+                        r=r_interp,
+                        theta=theta_interp_deg,
+                        mode='lines',
+                        line=dict(color='rgba(255,0,0,0.5)', width=3),
+                        fill='toself',
+                        fillcolor='rgba(255,0,0,0.1)',
+                        showlegend=False
+                    )
+                )
+                
+                # Add red dots at interpolation points
+                sample_indices = np.linspace(0, interp_points-1, len(fiber_angles_deg), dtype=int)
+                sample_r = [r_interp[i] for i in sample_indices]
+                sample_theta = [theta_interp_deg[i] for i in sample_indices]
+                
+                frame_data.append(
+                    go.Scatterpolar(
+                        r=sample_r,
+                        theta=sample_theta,
+                        mode='markers',
+                        marker=dict(size=8, color='red'),
+                        showlegend=False
+                    )
+                )
+            except Exception as e:
+                print(f"Interpolation skipped: {str(e)}")
                 pass
-    
-    st.session_state.data = None
-    st.session_state.loaded_fiber_ids = []
-    
-    # Clear all caches
-    try:
-        st.cache_data.clear()
-    except:
-        pass
-    
-    # Force garbage collection
-    gc.collect()
-    
-    # Reset the flag
-    st.session_state.out_of_memory = False
-    
-    st.info("Memory has been cleared. Please refresh the page to restart the application.")
-    st.stop()
-
-# --- Add memory safeguards throughout the app ---
-def check_memory_critical():
-    """Check if memory usage is critical and we need to recover"""
-    try:
-        memory = get_memory_usage()
-        if memory > 3000:  # Critical threshold - 3GB
-            # For extreme memory conditions, use out_of_memory mode
-            if memory > 3500:  # Extreme critical condition
-                st.session_state.out_of_memory = True
-                # Force reload
-                st.rerun()
-                return True
-            
-            # For high but not extreme, use maintenance mode
-            st.warning("⚠️ Critical memory usage detected. Entering Low Memory Mode to prevent crashes.")
-            # Enable maintenance mode
-            st.session_state.maintenance_mode = True
-            # Clear all caches and perform cleanup
-            perform_memory_cleanup(clear_streamlit_cache=True)
-            # Force reload
-            st.rerun()
-            return True
-        elif memory > 2000 and not st.session_state.maintenance_mode:
-            # Perform normal cleanup at high (but not critical) memory usage
-            perform_memory_cleanup(clear_streamlit_cache=False)
-            print(f"Automatic cleanup due to high memory usage: {memory:.2f}MB")
-            return False
-        return False
-    except Exception as e:
-        print(f"Error in check_memory_critical: {str(e)}")
-        return False
-
-# Call this check in key parts of the application
-check_memory_critical()
-
-# --- Export Video ---
-if export_button:
-    # First verify memory is sufficient
-    if get_memory_usage() > 2500:  # 2.5GB - risky for export
-        st.warning("Memory usage is already high, which may cause the export to fail. Please try restarting the app first.")
-        if st.button("Continue Anyway"):
-            pass  # Continue with export
-        else:
-            st.stop()  # Stop execution
-            
-    with st.spinner("Preparing for video export..."):
-        # Set quality based on selection
-        if export_quality == "Low":
-            frame_count = min(30, num_times)
-            batch_size = 5
-            img_width, img_height = 1280, 720  # 720p
-        elif export_quality == "Medium":
-            frame_count = min(60, num_times)
-            batch_size = 10
-            img_width, img_height = 1920, 1080  # 1080p
-        else:  # High
-            frame_count = min(100, num_times)
-            batch_size = 20
-            img_width, img_height = 2560, 1440  # 1440p
         
-        memory_before = get_memory_usage()
-        st.info(f"Memory usage before export: {memory_before:.2f} MB")
+        # Add current time indicator showing progress through the cycle
+        frame_data.append(
+            go.Scatter(
+                x=[0.05],
+                y=[0.05],
+                mode='text',
+                text=[f"t = {t:.3f}s (T={T:.3f}s)"],  # Show current time and period
+                textposition="bottom right",
+                showlegend=False
+            )
+        )
         
-        try:
-            video_filename = os.path.join(st.session_state.temp_dir, f"bearing_video_{freq_selected}Hz.mp4")
-            
-            # Create video writer
-            with imageio.get_writer(video_filename, fps=export_fps, quality=7) as writer:
-                # Process frames in smaller batches to control memory usage
-                num_batches = (frame_count + batch_size - 1) // batch_size
-                
-                # Create progress tracking
-                video_progress = st.progress(0)
-                status_text = st.empty()
-                
-                for batch_idx in range(num_batches):
-                    # Check if memory is becoming critical during export
-                    if check_memory_critical():
-                        break
-                        
-                    start_idx = batch_idx * batch_size
-                    end_idx = min(start_idx + batch_size, frame_count)
-                    batch_frames = range(start_idx, end_idx)
-                    
-                    status_text.text(f"Processing batch {batch_idx+1}/{num_batches} (frames {start_idx}-{end_idx-1})")
-                    
-                    # Generate frames for this batch only
-                    with st.spinner(f"Generating frames {start_idx}-{end_idx-1}..."):
-                        # Create a temp directory for this batch's frames
-                        batch_frames_dir = os.path.join(st.session_state.temp_dir, f"frames_batch_{batch_idx}")
-                        os.makedirs(batch_frames_dir, exist_ok=True)
-                        
-                        # Process each frame in the batch
-                        for i, t in enumerate(batch_frames):
-                            # Skip if memory is critical
-                            if check_memory_critical():
-                                break
-                            
-                            # Create a figure with subplots for all visualizations
-                            fig = make_subplots(
-                                rows=2, cols=2,
-                                specs=[[{"type": "polar", "rowspan": 1}, {"rowspan": 1}],
-                                      [{"colspan": 2}, None]],
-                                subplot_titles=("Bearing Visualization", "FFT Spectrum", "Peak Magnitude History"),
-                                vertical_spacing=0.1,
-                                horizontal_spacing=0.05,
-                                row_heights=[0.5, 0.5]
-                            )
-                            
-                            # Get data for current time step
-                            magnitudes = find_peak_magnitude_cached(freq_selected, t)
-                            max_mag = max(magnitudes) or 1.0
-                            radii = [1 + (m / max_mag) * 1.5 for m in magnitudes]
-                            
-                            # Add bearing visualization (polar plot)
-                            # Add bearing circle
-                            fig.add_trace(
-                                go.Scatterpolar(
-                                    r=[1]*361,
-                                    theta=list(range(361)),
-                                    mode='lines',
-                                    line=dict(color='gray', dash='dot'),
-                                    showlegend=False
-                                ),
-                                row=1, col=1
-                            )
-                            
-                            # Add sensor points and magnitude lines
-                            for idx, (angle, radius, name) in enumerate(zip(fiber_angles_deg, radii, fiber_names)):
-                                # Add magnitude line
-                                fig.add_trace(
-                                    go.Scatterpolar(
-                                        r=[1, radius],
-                                        theta=[angle, angle],
-                                        mode='lines+markers',
-                                        name=name,
-                                        line=dict(color=f'rgb({50+idx*25},{100+idx*20},{150+idx*15})'),
-                                        showlegend=False
-                                    ),
-                                    row=1, col=1
-                                )
-                            
-                            # Add FFT spectrum
-                            for idx, fiber in enumerate(fibers):
-                                fig.add_trace(
-                                    go.Scatter(
-                                        x=freqs,
-                                        y=fiber[:, t],
-                                        name=fiber_names[idx],
-                                        line=dict(color=f'rgb({50+idx*25},{100+idx*20},{150+idx*15})')
-                                    ),
-                                    row=1, col=2
-                                )
-                            
-                            # Add vertical line at selected frequency
-                            fig.add_vline(
-                                x=freq_selected,
-                                line=dict(color="red", width=2, dash="dash"),
-                                row=1, col=2
-                            )
-                            
-                            # Add magnitude history
-                            history_data = get_magnitude_history(freq_selected)
-                            for idx, data in enumerate(history_data):
-                                fig.add_trace(
-                                    go.Scatter(
-                                        x=data['x'][:t+1],
-                                        y=data['y'][:t+1],
-                                        name=data['name'],
-                                        line=data['line']
-                                    ),
-                                    row=2, col=1
-                                )
-                            
-                            # Add vertical line at current time
-                            fig.add_vline(
-                                x=time_formatted[t],
-                                line=dict(color="red", width=2, dash="dash"),
-                                row=2, col=1
-                            )
-                            
-                            # Update layout
-                            fig.update_layout(
-                                title=f"Ball Bearing @ {freq_selected} Hz - {time_formatted[t].strftime('%Y-%m-%d %H:%M:%S')}",
-                                height=img_height,
-                                width=img_width,
-                                showlegend=True,
-                                legend=dict(
-                                    orientation="h",
-                                    yanchor="bottom",
-                                    y=-0.2,
-                                    xanchor="center",
-                                    x=0.5
-                                )
-                            )
-                            
-                            # Update axes
-                            fig.update_xaxes(title="Frequency (Hz)", row=1, col=2)
-                            fig.update_yaxes(title="Magnitude", row=1, col=2)
-                            fig.update_xaxes(title="Time", row=2, col=1)
-                            fig.update_yaxes(title="Magnitude", row=2, col=1)
-                            
-                            # Save frame
-                            frame_path = os.path.join(batch_frames_dir, f"frame_{t:04d}.png")
-                            fig.write_image(frame_path, width=img_width, height=img_height)
-                            
-                            # Close figure to free memory
-                            fig.data = []
-                            fig = None
-                            
-                            # Update progress
-                            total_progress = (batch_idx * batch_size + i + 1) / frame_count
-                            video_progress.progress(total_progress)
-                            
-                            # Force garbage collection
-                            gc.collect()
-                    
-                    # Add frames to video
-                    for t in batch_frames:
-                        frame_path = os.path.join(batch_frames_dir, f"frame_{t:04d}.png")
-                        img = imageio.imread(frame_path)
-                        writer.append_data(img)
-                        os.remove(frame_path)
-                    
-                    # Clean up batch directory
-                    try:
-                        os.rmdir(batch_frames_dir)
-                    except:
-                        pass
-                    
-                    # Run memory cleanup after each batch
-                    perform_memory_cleanup()
-            
-            # Clear progress indicators
-            video_progress.empty()
-            status_text.empty()
-            
-            # Report final memory usage
-            memory_final = get_memory_usage()
-            st.info(f"Final memory usage: {memory_final:.2f} MB")
-            
-            # Provide download link
-            st.markdown(get_binary_file_downloader_html(video_filename, f'Bearing Video ({freq_selected} Hz)'), unsafe_allow_html=True)
-            st.success(f"Video created successfully! Click the link above to download.")
-            
-            # Clear memory after video export
-            perform_memory_cleanup()
-            
-        except Exception as e:
-            st.error(f"Error creating video: {str(e)}")
-            st.info("Try using a lower quality setting or fewer frames to reduce memory usage.")
-            # Clear up any partial files
-            cleanup_temp_files()
+        # Create the frame
+        frames.append(go.Frame(
+            data=frame_data,
+            name=f"frame{frame_idx}"
+        ))
+    
+    # Add initial data (first frame) - reuse the first frame's data
+    if frames:
+        for trace in frames[0].data:
+            fig.add_trace(trace)
+    
+    # Configure animation
+    fig.frames = frames
+    
+    # Calculate frame duration to complete one cycle based on fps
+    frame_duration = (T * 1000) / len(frames)  # Convert to milliseconds
+    
+    animation_settings = dict(
+        frame=dict(duration=frame_duration, redraw=True),
+        fromcurrent=True,
+        mode="immediate"
+    )
+    
+    # Add play and pause buttons
+    fig.update_layout(
+        updatemenus=[
+            dict(
+                type="buttons",
+                showactive=False,
+                buttons=[
+                    dict(
+                        label="Play",
+                        method="animate",
+                        args=[None, animation_settings]
+                    ),
+                    dict(
+                        label="Pause",
+                        method="animate",
+                        args=[[None], dict(frame=dict(duration=0, redraw=True), mode="immediate")]
+                    )
+                ],
+                direction="left",
+                pad=dict(r=10, t=10),
+                x=0.1,
+                y=0,
+                xanchor="right",
+                yanchor="top"
+            )
+        ],
+        polar=dict(
+            radialaxis=dict(visible=False, range=[0, 3]),
+            angularaxis=dict(tickfont=dict(size=10))
+        ),
+        margin=dict(t=50, l=0, r=0, b=0),
+        title=dict(
+            text=f"Ball Bearing @ {freq_selected} Hz (T={T:.3f}s)" + 
+                (f"<br>{timestamp}" if timestamp else ""),
+            font=dict(size=16)
+        ),
+        height=600,
+        width=600
+    )
+    
+    return fig
+
+# --- Create layout ---
+st.subheader(f"Visualization for {freq_selected} Hz at {time_formatted[time_idx].strftime('%Y-%m-%d %H:%M:%S')}")
+
+# Create two columns
+col_bearing, col_fft = st.columns(2)
+
+# Show the animated bearing plot
+with col_bearing:
+    st.subheader("Bearing Visualization (Animated)")
+    animated_fig = plot_bearing_animated_cached(time_idx, freq_selected, fps=animation_fps)
+    st.plotly_chart(animated_fig, use_container_width=True)
+
+# Show FFT spectrum
+with col_fft:
+    st.subheader("FFT Spectrum")
+    fig_fft = plot_fft_cached(time_idx, freq_selected)
+    st.plotly_chart(fig_fft, use_container_width=True)
+
+# Show magnitude history
+st.subheader("Peak Magnitude History")
+fig_hist = plot_magnitude_history(time_idx, freq_selected)
+st.plotly_chart(fig_hist, use_container_width=True)
 
 # Add memory info at the bottom of the page
 if st.checkbox("Show Memory Information", value=False):
@@ -1502,16 +1040,6 @@ def cleanup_temp_files():
 if st.sidebar.button("Clean Temporary Files"):
     cleanup_temp_files()
 
-# Cleanup temporary files when app is closed
-# Note: This might not always run in Streamlit cloud environment
-def cleanup():
-    if os.path.exists(st.session_state.temp_dir):
-        import shutil
-        shutil.rmtree(st.session_state.temp_dir)
-
-import atexit
-atexit.register(cleanup)
-
 # Add button to unload data and free memory
 if st.sidebar.button("Unload Unused Data"):
     # Count how many fiber datasets are loaded
@@ -1535,3 +1063,87 @@ if st.sidebar.button("Unload Unused Data"):
         st.sidebar.success(f"Unloaded unused data. Before: {before:.2f} MB, After: {after:.2f} MB, Saved: {before - after:.2f} MB")
     else:
         st.sidebar.info("No unused fiber data to unload.")
+
+# --- Add memory safeguards throughout the app ---
+def check_memory_critical():
+    """Check if memory usage is critical and we need to recover"""
+    try:
+        memory = get_memory_usage()
+        if memory > 3000:  # Critical threshold - 3GB
+            # For extreme memory conditions, use out_of_memory mode
+            if memory > 3500:  # Extreme critical condition
+                st.session_state.out_of_memory = True
+                # Force reload
+                st.rerun()
+                return True
+            
+            # For high but not extreme, use maintenance mode
+            st.warning("⚠️ Critical memory usage detected. Entering Low Memory Mode to prevent crashes.")
+            # Enable maintenance mode
+            st.session_state.maintenance_mode = True
+            # Clear all caches and perform cleanup
+            perform_memory_cleanup(clear_streamlit_cache=True)
+            # Force reload
+            st.rerun()
+            return True
+        elif memory > 2000 and not st.session_state.maintenance_mode:
+            # Perform normal cleanup at high (but not critical) memory usage
+            perform_memory_cleanup(clear_streamlit_cache=False)
+            print(f"Automatic cleanup due to high memory usage: {memory:.2f}MB")
+            return False
+        return False
+    except Exception as e:
+        print(f"Error in check_memory_critical: {str(e)}")
+        return False
+
+# Add a recovery mechanism in case app runs out of memory
+if 'out_of_memory' not in st.session_state:
+    st.session_state.out_of_memory = False
+
+# Check if we're in recovery mode
+if st.session_state.out_of_memory:
+    st.error("The application ran out of memory. We've cleared caches and reset data to recover.")
+    
+    # Clear all data
+    for key in list(st.session_state.keys()):
+        if key not in ['out_of_memory', 'temp_dir', 'auto_cleanup']:
+            try:
+                del st.session_state[key]
+            except Exception as e:
+                print(f"Error deleting session state key {key}: {str(e)}")
+                pass
+        
+        st.session_state.data = None
+        st.session_state.loaded_fiber_ids = []
+        
+        # Clear all caches
+        try:
+            st.cache_data.clear()
+        except Exception as e:
+            print(f"Error clearing cache: {str(e)}")
+            pass
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Reset the flag
+        st.session_state.out_of_memory = False
+        
+        st.info("Memory has been cleared. Please refresh the page to restart the application.")
+        st.stop()
+
+# Call this check in key parts of the application
+check_memory_critical()
+
+# Cleanup temporary files when app is closed
+# Note: This might not always run in Streamlit cloud environment
+def cleanup():
+    try:
+        if os.path.exists(st.session_state.temp_dir):
+            import shutil
+            shutil.rmtree(st.session_state.temp_dir)
+    except Exception as e:
+        print(f"Error during cleanup: {str(e)}")
+
+import atexit
+atexit.register(cleanup)
