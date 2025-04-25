@@ -1015,3 +1015,105 @@ def cleanup():
 
 import atexit
 atexit.register(cleanup)
+
+# --- Memory Management Functions ---
+def perform_memory_cleanup(clear_streamlit_cache=False):
+    """Perform a full memory cleanup including garbage collection and temp file removal"""
+    # Run the Python garbage collector
+    before = get_memory_usage()
+    gc.collect()
+    
+    # Clear cache for heavyweight cached functions
+    try:
+        plot_bearing_animated_cached.clear()
+        plot_fft_cached.clear()
+        get_magnitude_history.clear()
+        find_peak_magnitude_cached.clear()
+    except Exception as e:
+        print(f"Error clearing function caches: {str(e)}")
+    
+    # Optionally clear all Streamlit cache - use cautiously as this reloads all data
+    if clear_streamlit_cache and before > 1500:  # 1.5GB threshold
+        try:
+            st.cache_data.clear()
+            print("Cleared all Streamlit cache due to high memory usage")
+        except Exception as e:
+            print(f"Error clearing streamlit cache: {str(e)}")
+    
+    # Clean temporary files that are no longer needed
+    temp_dir = st.session_state.temp_dir
+    if os.path.exists(temp_dir):
+        frames_dir = os.path.join(temp_dir, "frames")
+        if os.path.exists(frames_dir):
+            for root, dirs, files in os.walk(frames_dir, topdown=False):
+                for file in files:
+                    try:
+                        os.remove(os.path.join(root, file))
+                    except:
+                        pass
+    
+    # Free memory by reducing fiber data size if memory is high
+    if before > 1000 and 'fiber_ids_to_load' in globals():  # 1GB threshold
+        # If memory usage is high, try to unload unused fibers
+        unloaded_count = 0
+        try:
+            # Only keep currently visible fibers in memory
+            visible_fibers = [f'fft_fiber_1_{i}_mags' for i in range(1, 5)] + [f'fft_fiber_2_{i}_mags' for i in range(1, 5)] + \
+                           [f'fft_fiber_1_{i}_phases' for i in range(1, 5)] + [f'fft_fiber_2_{i}_phases' for i in range(1, 5)]
+            for fiber_id in st.session_state.loaded_fiber_ids[:]:
+                if fiber_id not in visible_fibers:
+                    # Remove from session state
+                    if fiber_id in st.session_state:
+                        del st.session_state[fiber_id]
+                        st.session_state.loaded_fiber_ids.remove(fiber_id)
+                        unloaded_count += 1
+            if unloaded_count > 0:
+                print(f"Unloaded {unloaded_count} fiber datasets to free memory")
+        except Exception as e:
+            print(f"Error while unloading fiber data: {str(e)}")
+    
+    # Run garbage collection again after clearing files
+    gc.collect()
+    after = get_memory_usage()
+    
+    # Log cleanup in session state
+    st.session_state.last_cleanup_time = datetime.datetime.now()
+    cleanup_savings = before - after
+    
+    # If cleanup didn't free much memory and usage is still high, try more aggressive approach
+    if cleanup_savings < 10 and after > 1000:
+        print("Initial cleanup didn't free much memory, trying more aggressive approach")
+        # Try to release memory from large dataframes or objects
+        for key in list(st.session_state.keys()):
+            # Skip essential keys
+            if key in ['temp_dir', 'auto_cleanup', 'maintenance_mode', 'last_cleanup_time']:
+                continue
+            
+            # Try to identify large objects that can be safely removed
+            try:
+                obj_size = sys.getsizeof(st.session_state[key]) / (1024 * 1024)  # Size in MB
+                if obj_size > 10:  # If object is larger than 10MB
+                    print(f"Removing large object '{key}' of size {obj_size:.2f}MB")
+                    del st.session_state[key]
+            except:
+                pass
+        
+        # Run GC again
+        gc.collect()
+        final = get_memory_usage()
+        cleanup_savings = before - final
+        after = final
+    
+    # Log to console for debugging
+    print(f"Auto cleanup completed at {st.session_state.last_cleanup_time}. Memory before: {before:.2f}MB, after: {after:.2f}MB, saved: {cleanup_savings:.2f}MB")
+    return before, after
+
+def check_memory_threshold(threshold_mb=2000):
+    """Check if memory usage exceeds threshold and clear caches if needed"""
+    current_memory = get_memory_usage()
+    if current_memory > threshold_mb:
+        print(f"Memory usage {current_memory:.2f}MB exceeds threshold {threshold_mb}MB, performing cleanup")
+        with st.session_state.cleanup_lock:
+            perform_memory_cleanup()
+        return True
+    return False
