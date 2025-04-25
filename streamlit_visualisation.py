@@ -631,8 +631,8 @@ def create_animated_bearing(magnitudes, phases, freq_selected, fps=5, timestamp=
     T = 1.0 / freq_selected
     
     # Create time vector with 100 points over one period
-    num_points = 100
-    tvec = np.linspace(0, 2*T, num_points)
+    num_points = 200
+    tvec = np.linspace(0, 5*T, num_points)
     
     # Create frames for the animation - we'll show the full cycle regardless of fps
     frames = []
